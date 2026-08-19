@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required under the hardened runtime. Without it macOS denies the
+         microphone outright, without prompting, and the app never appears in
+         Privacy & Security › Microphone at all. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Deliberately NOT sandboxed: the Accessibility APIs used to observe the
+         hotkey and post the paste keystroke are unavailable inside a sandbox. -->
+</dict>
+</plist>

@@ -1,0 +1,614 @@
+import AppKit
+import MurmurCore
+import SwiftUI
+
+/// The settings window, opened from the menu bar.
+@MainActor
+final class SettingsWindowController {
+
+    private var window: NSWindow?
+    private let preferences: Preferences
+    private let onChange: () -> Void
+
+    init(preferences: Preferences, onChange: @escaping () -> Void) {
+        self.preferences = preferences
+        self.onChange = onChange
+    }
+
+    func show() {
+        if let window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let view = SettingsView(preferences: preferences, onChange: onChange)
+        let hosting = NSHostingController(rootView: view)
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "Murmur Settings"
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.setContentSize(NSSize(width: 620, height: 520))
+        window.center()
+        window.isReleasedWhenClosed = false
+        self.window = window
+
+        window.makeKeyAndOrderFront(nil)
+        // Settings is the one place Murmur legitimately takes focus.
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+private struct SettingsView: View {
+    @ObservedObject var preferences: Preferences
+    let onChange: () -> Void
+
+    var body: some View {
+        TabView {
+            GeneralSettings(preferences: preferences, onChange: onChange)
+                .tabItem { Label("General", systemImage: "keyboard") }
+            CleanupSettings(preferences: preferences, onChange: onChange)
+                .tabItem { Label("Cleanup", systemImage: "wand.and.stars") }
+            VocabularySettings(onChange: onChange)
+                .tabItem { Label("Words", systemImage: "character.book.closed") }
+            ModelSettings(onChange: onChange)
+                .tabItem { Label("Models", systemImage: "shippingbox") }
+        }
+        .frame(width: 620, height: 520)
+    }
+}
+
+// MARK: - General
+
+private struct GeneralSettings: View {
+    @ObservedObject var preferences: Preferences
+    let onChange: () -> Void
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Hold-to-talk key", selection: $preferences.hotkey) {
+                    ForEach(Hotkey.allCases, id: \.self) { key in
+                        Text(key.displayName).tag(key)
+                    }
+                }
+                .onChange(of: preferences.hotkey) { _, _ in onChange() }
+
+                if preferences.hotkey == .fn {
+                    Text(
+                        "Set System Settings › Keyboard › \"Press 🌐 key to\" to "
+                            + "\"Do Nothing\", or macOS will act on the key as well."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Hotkey")
+            } footer: {
+                Text("Hold the key to dictate, release to insert. It never toggles.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Accidental presses") {
+                Picker(
+                    "Ignore presses shorter than",
+                    selection: $preferences.minimumHoldMilliseconds
+                ) {
+                    Text("Off").tag(0)
+                    Text("150 ms").tag(150)
+                    Text("250 ms").tag(250)
+                    Text("400 ms").tag(400)
+                }
+                .onChange(of: preferences.minimumHoldMilliseconds) { _, _ in onChange() }
+                Text("A brief tap is treated as an ordinary keypress and inserts nothing.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+// MARK: - Cleanup
+
+private struct CleanupSettings: View {
+    @ObservedObject var preferences: Preferences
+    let onChange: () -> Void
+
+    private var unavailableReason: String? { FoundationModelsCleaner.unavailableReason }
+
+    var body: some View {
+        Form {
+            Section("Correction strength") {
+                ForEach(CleanupLevel.allCases) { level in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(
+                            systemName: preferences.cleanupLevel == level
+                                ? "largecircle.fill.circle" : "circle"
+                        )
+                        .foregroundStyle(preferences.cleanupLevel == level ? Color.accentColor : .secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(level.displayName).font(.body)
+                            Text(level.summary)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard unavailableReason == nil || level == .off else { return }
+                        preferences.cleanupLevel = level
+                        onChange()
+                    }
+                    .opacity(unavailableReason == nil || level == .off ? 1 : 0.4)
+                }
+            }
+
+            Section("Safeguards") {
+                Label(
+                    "Questions you dictate are never answered, only punctuated.",
+                    systemImage: "checkmark.shield"
+                )
+                Label(
+                    "A reply that stops looking like a correction is discarded, "
+                        + "and your raw words are inserted instead.",
+                    systemImage: "checkmark.shield"
+                )
+                Label("Runs entirely on this Mac. Nothing is uploaded.", systemImage: "lock")
+            }
+            .font(.callout)
+
+            if let unavailableReason {
+                Section {
+                    Label(unavailableReason, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+// MARK: - Vocabulary
+
+@MainActor
+private final class VocabularyModel: ObservableObject {
+    @Published var terms: [VocabularyTerm] = []
+    @Published var draft: String = ""
+    @Published var duplicateWarning = false
+
+    private let store = VocabularyStore.shared
+
+    func load() { terms = store.allTerms }
+
+    func add() {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        duplicateWarning = !store.add(text)
+        if !duplicateWarning { draft = "" }
+        load()
+    }
+
+    func remove(_ term: VocabularyTerm) {
+        store.remove(term)
+        load()
+    }
+
+    func update(_ term: VocabularyTerm) {
+        store.update(term)
+        load()
+    }
+}
+
+private struct VocabularySettings: View {
+    @StateObject private var model = VocabularyModel()
+    let onChange: () -> Void
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Your words").font(.headline)
+                Text(
+                    "Names and terms Murmur should recognize — \"VS Code\", \"Claude\", "
+                        + "project names, colleagues' names."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                TextField("Add a word or phrase", text: $model.draft)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($fieldFocused)
+                    .onSubmit { commit() }
+                Button("Add") { commit() }
+                    .disabled(model.draft.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+
+            if model.duplicateWarning {
+                Label("That word is already in the list.", systemImage: "info.circle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            if model.terms.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "character.book.closed")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("No words yet.").foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(model.terms) { term in
+                        TermRow(
+                            term: term,
+                            onUpdate: {
+                                model.update($0)
+                                onChange()
+                            },
+                            onRemove: {
+                                model.remove(term)
+                                onChange()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+        .padding()
+        .onAppear { model.load() }
+    }
+
+    private func commit() {
+        model.add()
+        onChange()
+        fieldFocused = true
+    }
+}
+
+/// One word, with the misheard variants that should map back to it.
+private struct TermRow: View {
+    let term: VocabularyTerm
+    let onUpdate: (VocabularyTerm) -> Void
+    let onRemove: () -> Void
+
+    @State private var expanded = false
+    @State private var alias = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button {
+                    expanded.toggle()
+                } label: {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+
+                Text(term.text)
+                if !term.soundsLike.isEmpty {
+                    Text("heard as \(term.soundsLike.joined(separator: ", "))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(action: onRemove) { Image(systemName: "trash") }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+            }
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Sometimes misheard as")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    HStack {
+                        TextField("e.g. cloud", text: $alias)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { addAlias() }
+                        Button("Add", action: addAlias)
+                            .disabled(alias.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+
+                    if !term.soundsLike.isEmpty {
+                        FlowChips(items: term.soundsLike) { removeAlias($0) }
+                    }
+
+                    Toggle(
+                        "Always replace, even when the ordinary word was meant",
+                        isOn: Binding(
+                            get: { term.alwaysReplace },
+                            set: { newValue in
+                                var updated = term
+                                updated.alwaysReplace = newValue
+                                onUpdate(updated)
+                            }
+                        )
+                    )
+                    .font(.callout)
+                    .disabled(term.soundsLike.isEmpty)
+
+                    Text(
+                        term.alwaysReplace
+                            ? "Every occurrence is rewritten. \"in the cloud\" would become "
+                                + "\"in the Claude\"."
+                            : "The correction model decides from context, so ordinary uses of "
+                                + "the everyday word are left alone."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(term.alwaysReplace ? .orange : .secondary)
+                }
+                .padding(.leading, 20)
+                .padding(.bottom, 4)
+            }
+        }
+    }
+
+    private func addAlias() {
+        let text = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        var updated = term
+        guard !updated.soundsLike.contains(where: { $0.lowercased() == text.lowercased() })
+        else {
+            alias = ""
+            return
+        }
+        updated.soundsLike.append(text)
+        onUpdate(updated)
+        alias = ""
+    }
+
+    private func removeAlias(_ value: String) {
+        var updated = term
+        updated.soundsLike.removeAll { $0 == value }
+        onUpdate(updated)
+    }
+}
+
+/// Removable chips for the misheard variants.
+private struct FlowChips: View {
+    let items: [String]
+    let onRemove: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(items, id: \.self) { item in
+                HStack(spacing: 4) {
+                    Text(item).font(.caption)
+                    Button {
+                        onRemove(item)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.12))
+                .clipShape(Capsule())
+            }
+        }
+    }
+}
+
+// MARK: - Models
+
+@MainActor
+private final class ModelListModel: ObservableObject {
+    @Published var installedIDs: Set<String> = []
+    @Published var activeSpeechID = ModelCatalog.appleSpeechID
+    @Published var activeCorrectionID = ModelCatalog.appleCorrectionID
+    @Published var busyID: String?
+    @Published var errorMessage: String?
+
+    /// Pushes the new choice into the running app. Without this the selection
+    /// would only be saved, and would not take effect until the next launch.
+    var onChange: () -> Void = {}
+
+    func state(for descriptor: AIModelDescriptor) -> ModelInstallState {
+        ModelCatalog.state(
+            for: descriptor,
+            appleSpeechAvailable: AppleSpeechEngine.isSupported,
+            appleCorrectionUnavailableReason: FoundationModelsCleaner.unavailableReason,
+            installedIDs: installedIDs
+        )
+    }
+
+    func activeID(for layer: ModelLayer) -> String {
+        layer == .speechRecognition ? activeSpeechID : activeCorrectionID
+    }
+
+    func activate(_ descriptor: AIModelDescriptor) {
+        switch descriptor.layer {
+        case .speechRecognition: activeSpeechID = descriptor.id
+        case .correction: activeCorrectionID = descriptor.id
+        }
+        Preferences.shared.activeSpeechModelID = activeSpeechID
+        Preferences.shared.activeCorrectionModelID = activeCorrectionID
+        onChange()
+    }
+
+    func load() {
+        activeSpeechID = Preferences.shared.activeSpeechModelID
+        activeCorrectionID = Preferences.shared.activeCorrectionModelID
+        installedIDs = ModelCatalog.installedModelIDs()
+    }
+
+    /// Downloads weights. Needs a network connection the first time only.
+    func download(_ descriptor: AIModelDescriptor) async {
+        busyID = descriptor.id
+        errorMessage = nil
+        defer { busyID = nil }
+        do {
+            try await ModelCatalog.install(descriptor)
+            Log.write("downloaded model \(descriptor.id)")
+        } catch {
+            errorMessage = "\(descriptor.name): \(error.localizedDescription)"
+            Log.write("model download failed for \(descriptor.id): \(error)")
+        }
+        installedIDs = ModelCatalog.installedModelIDs()
+    }
+
+    func delete(_ descriptor: AIModelDescriptor) {
+        do {
+            try ModelCatalog.delete(descriptor)
+            // Fall back to the built-in engine if the active model just went away.
+            if activeSpeechID == descriptor.id {
+                activate(ModelCatalog.model(id: ModelCatalog.appleSpeechID)!)
+            }
+        } catch {
+            errorMessage = "\(descriptor.name): \(error.localizedDescription)"
+        }
+        installedIDs = ModelCatalog.installedModelIDs()
+    }
+}
+
+private struct ModelSettings: View {
+    @StateObject private var model = ModelListModel()
+    let onChange: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                ForEach(ModelLayer.allCases) { layer in
+                    section(for: layer)
+                }
+
+                if let errorMessage = model.errorMessage {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+
+                Text(
+                    "Models are never bundled with Murmur. Anything not built into "
+                        + "macOS is downloaded only when you ask for it — that first "
+                        + "download needs an internet connection, and everything after "
+                        + "it runs offline on this Mac."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+            .padding()
+        }
+        .onAppear {
+            model.onChange = onChange
+            model.load()
+        }
+    }
+
+    private func section(for layer: ModelLayer) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(layer.title).font(.headline)
+            Text(layer.subtitle).font(.callout).foregroundStyle(.secondary)
+
+            VStack(spacing: 0) {
+                ForEach(Array(ModelCatalog.models(in: layer).enumerated()), id: \.element.id) {
+                    index, descriptor in
+                    if index > 0 { Divider() }
+                    row(descriptor)
+                }
+            }
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private func row(_ descriptor: AIModelDescriptor) -> some View {
+        let state = model.state(for: descriptor)
+        let isActive = model.activeID(for: descriptor.layer) == descriptor.id && state.isUsable
+
+        return HStack(alignment: .top, spacing: 10) {
+            Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
+                .foregroundStyle(isActive ? Color.accentColor : .secondary)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(descriptor.name).font(.body.weight(.medium))
+                    if descriptor.layer == .speechRecognition && descriptor.streams {
+                        Text("LIVE")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.green.opacity(0.18))
+                            .foregroundStyle(.green)
+                            .clipShape(Capsule())
+                    }
+                }
+                Text(descriptor.summary).font(.callout).foregroundStyle(.secondary)
+                Text("\(descriptor.vendor) · \(descriptor.sizeDescription) · \(descriptor.license)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                if case .unavailable(let reason) = state {
+                    Text(reason).font(.caption).foregroundStyle(.orange)
+                }
+                if descriptor.layer == .speechRecognition, !descriptor.punctuates {
+                    Label(
+                        "Needs AI correction turned on for punctuation.",
+                        systemImage: "exclamationmark.circle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+            }
+
+            Spacer()
+            actions(for: descriptor, state: state, isActive: isActive)
+        }
+        .padding(12)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard state.isUsable else { return }
+            model.activate(descriptor)
+        }
+    }
+
+    @ViewBuilder
+    private func actions(
+        for descriptor: AIModelDescriptor,
+        state: ModelInstallState,
+        isActive: Bool
+    ) -> some View {
+        switch state {
+        case .builtIn:
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(isActive ? "Active" : "Built in")
+                    .font(.callout)
+                    .foregroundStyle(isActive ? Color.accentColor : .secondary)
+            }
+        case .installed:
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(isActive ? "Active" : "Installed")
+                    .font(.callout)
+                    .foregroundStyle(isActive ? Color.accentColor : .secondary)
+                Button("Delete", role: .destructive) { model.delete(descriptor) }
+                    .buttonStyle(.link)
+            }
+        case .notInstalled:
+            if model.busyID == descriptor.id {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Downloading…").font(.callout).foregroundStyle(.secondary)
+                }
+            } else {
+                Button("Download") {
+                    Task { await model.download(descriptor) }
+                }
+                .disabled(model.busyID != nil)
+            }
+        case .downloading(let fraction):
+            ProgressView(value: fraction).frame(width: 90)
+        case .unavailable:
+            Text("Unavailable").font(.callout).foregroundStyle(.tertiary)
+        }
+    }
+}

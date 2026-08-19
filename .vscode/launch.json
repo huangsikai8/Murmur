@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Murmur}",
+            "name": "Debug MurmurTests",
+            "target": "MurmurTests",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MurmurTests"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Murmur}",
+            "name": "Release MurmurTests",
+            "target": "MurmurTests",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MurmurTests"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Murmur}",
+            "name": "Debug MurmurApp",
+            "target": "MurmurApp",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MurmurApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Murmur}",
+            "name": "Release MurmurApp",
+            "target": "MurmurApp",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MurmurApp"
+        }
+    ]
+}
