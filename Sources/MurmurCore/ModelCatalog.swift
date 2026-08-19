@@ -186,6 +186,24 @@ public enum ModelCatalog {
                 + "text with no punctuation, so it needs AI correction to be readable."
         ),
 
+        AIModelDescriptor(
+            id: ParakeetBatchEngine.modelID,
+            layer: .speechRecognition,
+            name: "NVIDIA Parakeet TDT 0.6B v2",
+            vendor: "NVIDIA via FluidAudio",
+            // 452 MB measured on disk. The HF repo totals ~2.6 GB because it
+            // carries several precisions; FluidAudio fetches only one set.
+            sizeMB: 452,
+            license: "CC BY 4.0",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "Decodes the whole utterance when you release the key, so no text "
+                + "appears while you speak. The most accurate English model here "
+                + "in exchange for that wait."
+        ),
+
         // MARK: Text cleanup
         AIModelDescriptor(
             id: appleCorrectionID,
@@ -263,6 +281,7 @@ public enum ModelCatalog {
         where MoonshineEngine.isInstalled(variant) {
             ids.insert(variant.modelID)
         }
+        if ParakeetBatchEngine.isInstalled { ids.insert(ParakeetBatchEngine.modelID) }
         return ids
     }
 
@@ -283,6 +302,10 @@ public enum ModelCatalog {
             try await MoonshineEngine(variant: variant).install(progress: progress)
             return
         }
+        if descriptor.id == ParakeetBatchEngine.modelID {
+            try await ParakeetBatchEngine().install()
+            return
+        }
         throw SpeechEngineError.unavailable("\(descriptor.name) cannot be downloaded yet.")
     }
 
@@ -298,6 +321,10 @@ public enum ModelCatalog {
         }
         if let variant = MoonshineEngine.Variant.from(modelID: descriptor.id) {
             try MoonshineEngine.delete(variant)
+            return
+        }
+        if descriptor.id == ParakeetBatchEngine.modelID {
+            try ParakeetBatchEngine.delete()
         }
     }
 

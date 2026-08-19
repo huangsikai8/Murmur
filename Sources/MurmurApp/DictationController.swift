@@ -42,6 +42,10 @@ final class DictationController {
     private var isActive = false
     private var pressedAt: ContinuousClock.Instant?
     private var activeModelID = ModelCatalog.appleSpeechID
+    /// False for engines that only produce text when the key is released. The
+    /// overlay needs to say so rather than sit empty.
+    private var engineStreamsLiveText = true
+    private var meterTask: Task<Void, Never>?
     private var activeCorrectionModelID = ModelCatalog.appleCorrectionID
 
     init(
@@ -112,6 +116,7 @@ final class DictationController {
         await engine.releaseModels()
         engine = desired
         activeModelID = modelID
+        engineStreamsLiveText = SpeechEngineFactory.streamsLiveText(for: modelID) ?? true
         do {
             try await engine.prepare()
             let format = await engine.preferredInputFormat()
@@ -164,7 +169,8 @@ final class DictationController {
         buffer.reset()
         pressedAt = ContinuousClock.now
         focusTarget = FocusTracker.capture()
-        overlay.show()
+        overlay.show(showsMeter: !engineStreamsLiveText)
+        startMeter()
         status = .listening
 
         Task { await startPipeline() }
@@ -174,6 +180,7 @@ final class DictationController {
         guard isActive else { return }
         isActive = false
         latency.mark(.hotkeyUp)
+        stopMeter()
         capture.stop()
 
         // Discard an incidental tap without inserting anything.
@@ -190,6 +197,26 @@ final class DictationController {
         status = .finishing
         overlay.setState(.transcribing)
         Task { await finishPipeline() }
+    }
+
+    /// Feeds the overlay's meter from real microphone levels while listening.
+    /// Only runs for engines that show no text, since it exists to prove the
+    /// microphone is live when nothing else would.
+    private func startMeter() {
+        guard !engineStreamsLiveText else { return }
+        meterTask?.cancel()
+        meterTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                overlay.pushLevel(capture.currentLevel)
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
+    private func stopMeter() {
+        meterTask?.cancel()
+        meterTask = nil
     }
 
     // MARK: - Pipeline
@@ -274,6 +301,7 @@ final class DictationController {
 
     private func fail(with error: Error) async {
         isActive = false
+        stopMeter()
         capture.stop()
         await engine.cancelSession()
         updatesTask?.cancel()

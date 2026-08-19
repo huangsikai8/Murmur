@@ -56,10 +56,14 @@ enum SelfTest {
                 if !matched {
                     print("      got: \"\(result.text)\"")
                 }
-                print(
-                    "      first partial \(result.firstPartialMs) ms, "
-                        + "finalize \(result.finalizeMs) ms"
-                )
+                // A batch engine never emits a partial, so there is no such
+                // number to report — printing the unset sentinel would look
+                // like a measurement rather than an absence.
+                let partial =
+                    result.firstPartialMs < 0
+                    ? "no partials (decodes on release)"
+                    : "first partial \(result.firstPartialMs) ms"
+                print("      \(partial), finalize \(result.finalizeMs) ms")
                 // Word-splitting corruption is a hard failure regardless of
                 // whether the recognizer heard every word correctly.
                 for corruption in ["act ually", "cor rectly", "beca use", " ."] {

@@ -625,17 +625,27 @@ await runner.test("word lists saved before aliases existed still decode") {
 
 runner.suite("Model catalog")
 
-await runner.test("both layers offer five models") {
-    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 5)
+await runner.test("both layers offer the expected number of models") {
+    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 6)
     runner.expectEqual(ModelCatalog.models(in: .correction).count, 5)
 }
 
-// The hard requirement: text must appear live, so a non-streaming speech model
-// must never be offered.
-await runner.test("every speech model streams live text") {
-    for model in ModelCatalog.models(in: .speechRecognition) {
-        runner.expect(model.streams, "\(model.name) does not stream")
-    }
+await runner.test("each speech model's streaming claim matches its engine") {
+    // Murmur used to list streaming models only. Non-streaming ones are now
+    // allowed, so the invariant is no longer "everything streams" but "the
+    // catalog says which, truthfully" — the flag drives the overlay, and a
+    // model wrongly marked live would show an empty box for the whole hold.
+    runner.expectEqual(
+        SpeechEngineFactory.mislabeledSpeechModelIDs,
+        [],
+        "speech models whose streams flag contradicts their engine"
+    )
+}
+
+await runner.test("at least one speech model streams and one does not") {
+    let speech = ModelCatalog.models(in: .speechRecognition)
+    runner.expect(speech.contains { $0.streams }, "no live model is offered")
+    runner.expect(speech.contains { !$0.streams }, "no on-release model is offered")
 }
 
 await runner.test("model ids are unique") {
@@ -736,8 +746,10 @@ await runner.test("downloadable cleanup models map to an MLX variant") {
 // it, or the UI would offer a download that goes nowhere.
 await runner.test("every non-Apple catalog model maps to a real engine") {
     for model in ModelCatalog.all where model.runtime == .coreML {
+        // Core ML covers both the streaming FluidAudio variants and the batch
+        // Parakeet checkpoint, so the factory is the authority here.
         runner.expect(
-            FluidAudioEngine.Variant.from(modelID: model.id) != nil,
+            SpeechEngineFactory.engine(for: model.id) != nil,
             "\(model.name) claims Core ML but has no engine"
         )
     }

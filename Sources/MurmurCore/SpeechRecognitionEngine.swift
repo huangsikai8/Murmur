@@ -90,7 +90,26 @@ public enum SpeechEngineFactory {
         if let variant = MoonshineEngine.Variant.from(modelID: modelID) {
             return MoonshineEngine(variant: variant)
         }
+        if modelID == ParakeetBatchEngine.modelID { return ParakeetBatchEngine() }
         return nil
+    }
+
+    /// Whether `modelID`'s engine produces text while you speak, rather than
+    /// only when the key is released. Derived from the engine that would
+    /// actually run, so a catalog entry cannot claim live text it never emits.
+    public static func streamsLiveText(for modelID: String) -> Bool? {
+        guard let engine = engine(for: modelID) else { return nil }
+        return !(engine is ParakeetBatchEngine)
+    }
+
+    /// Speech models whose catalog `streams` flag disagrees with the engine
+    /// behind them. A model wrongly marked live shows an empty overlay for the
+    /// whole hold and reads as broken.
+    public static var mislabeledSpeechModelIDs: [String] {
+        ModelCatalog.models(in: .speechRecognition).filter { descriptor in
+            guard let streams = streamsLiveText(for: descriptor.id) else { return false }
+            return streams != descriptor.streams
+        }.map(\.id)
     }
 
     /// Whether every speech model in the catalog can actually be instantiated.

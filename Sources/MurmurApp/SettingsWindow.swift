@@ -506,20 +506,42 @@ private struct ModelSettings: View {
     }
 
     private func section(for layer: ModelLayer) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let models = ModelCatalog.models(in: layer)
+        return VStack(alignment: .leading, spacing: 8) {
             Text(layer.title).font(.headline)
             Text(layer.subtitle).font(.callout).foregroundStyle(.secondary)
 
-            VStack(spacing: 0) {
-                ForEach(Array(ModelCatalog.models(in: layer).enumerated()), id: \.element.id) {
-                    index, descriptor in
-                    if index > 0 { Divider() }
-                    row(descriptor)
-                }
+            if layer == .speechRecognition {
+                // The wait is the thing worth knowing before choosing, so the
+                // two kinds are separated rather than mixed and badged alone.
+                group("Live as you speak", models.filter(\.streams))
+                group("Only when you release the key", models.filter { !$0.streams })
+            } else {
+                list(models)
             }
-            .background(Color(nsColor: .controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
+    }
+
+    @ViewBuilder
+    private func group(_ title: String, _ models: [AIModelDescriptor]) -> some View {
+        if !models.isEmpty {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+            list(models)
+        }
+    }
+
+    private func list(_ models: [AIModelDescriptor]) -> some View {
+        VStack(spacing: 0) {
+            ForEach(Array(models.enumerated()), id: \.element.id) { index, descriptor in
+                if index > 0 { Divider() }
+                row(descriptor)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private func row(_ descriptor: AIModelDescriptor) -> some View {
@@ -534,13 +556,15 @@ private struct ModelSettings: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(descriptor.name).font(.body.weight(.medium))
-                    if descriptor.layer == .speechRecognition && descriptor.streams {
-                        Text("LIVE")
+                    if descriptor.layer == .speechRecognition {
+                        Text(descriptor.streams ? "LIVE" : "ON RELEASE")
                             .font(.caption2.weight(.bold))
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
-                            .background(Color.green.opacity(0.18))
-                            .foregroundStyle(.green)
+                            .background(
+                                (descriptor.streams ? Color.green : Color.orange).opacity(0.18)
+                            )
+                            .foregroundStyle(descriptor.streams ? Color.green : Color.orange)
                             .clipShape(Capsule())
                     }
                 }
