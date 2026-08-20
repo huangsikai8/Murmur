@@ -69,6 +69,15 @@ public protocol SpeechRecognitionEngine: AnyObject, Sendable {
 extension SpeechRecognitionEngine {
     /// Engines without contextual biasing simply ignore the word list.
     public func setContextualPhrases(_ phrases: [String]) async {}
+
+    /// Whether `setContextualPhrases` does anything at all.
+    ///
+    /// The default above is an empty implementation, which is convenient and
+    /// silent: an engine that ignores biasing looks identical to one that
+    /// applies it, so a word list can sit in Settings doing nothing while the
+    /// speaker keeps wondering why their own terms are misheard. Engines that
+    /// really bias say so, and the app logs when the selected one does not.
+    public var biasesTowardPhrases: Bool { false }
 }
 
 /// Builds the engine for a catalog model ID.

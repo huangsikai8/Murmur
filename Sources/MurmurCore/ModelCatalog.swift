@@ -120,7 +120,8 @@ public enum ModelCatalog {
             layer: .speechRecognition,
             name: "NVIDIA Nemotron Streaming 0.6B (English)",
             vendor: "NVIDIA via FluidAudio",
-            sizeMB: 1200,
+            // 599 MB measured on disk, not the 1200 previously guessed.
+            sizeMB: 599,
             license: "NVIDIA Community Model License",
             streams: true,
             runtime: .coreML,
@@ -128,6 +129,36 @@ public enum ModelCatalog {
             summary:
                 "Cache-aware streaming FastConformer with an RNN-T decoder. The largest "
                 + "and most accurate downloadable option here, at three latency tiers."
+        ),
+        AIModelDescriptor(
+            id: "nvidia.nemotron-streaming-en-0.6b-1120ms",
+            layer: .speechRecognition,
+            name: "NVIDIA Nemotron Streaming 0.6B (1.12 s)",
+            vendor: "NVIDIA via FluidAudio",
+            sizeMB: 613,
+            license: "NVIDIA Community Model License",
+            streams: true,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "The same recognizer at NVIDIA's trained 1.12 s chunk instead of "
+                + "2.24 s, so the live text updates twice as often. A separate "
+                + "download: the latency tiers are distinct model repositories."
+        ),
+        AIModelDescriptor(
+            id: "nvidia.nemotron-streaming-en-0.6b-560ms",
+            layer: .speechRecognition,
+            name: "NVIDIA Nemotron Streaming 0.6B (0.56 s)",
+            vendor: "NVIDIA via FluidAudio",
+            sizeMB: 613,
+            license: "NVIDIA Community Model License",
+            streams: true,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "Lowest-latency Nemotron tier, updating the live text most often. "
+                + "Furthest from the chunk the model was trained on, so it is the "
+                + "one to check for accuracy before relying on it."
         ),
         AIModelDescriptor(
             id: "moonshine.streaming-medium",

@@ -1,3 +1,5 @@
+<img src="Resources/murmur-logo.png" width="120" alt="Murmur">
+
 # Murmur
 
 Hold a key, speak, release, and the sentence appears in whatever text field had
@@ -40,6 +42,25 @@ macOS gives the Fn/Globe key its own behaviour (emoji picker or input-source
 switching), which will fight Murmur and steal focus. If you would rather leave
 the Globe key alone, pick a different trigger from the menu bar under
 **Hold-to-Talk Key** — Right Option is the least contested alternative.
+
+### The microphone indicator
+
+Murmur holds the input device open while it is running, so that pressing the
+dictation key only switches where the audio goes rather than opening a device —
+which measured up to half a second, all of it taken off the front of what you
+said. macOS shows the orange microphone indicator for as long as the device is
+open. Nothing is transcribed, inserted or written to disk unless you start a
+dictation; while idle the audio is kept for 0.3 s so a word begun just before
+the key is not lost, and is then discarded.
+
+Turn it off from the menu bar under **Keep Microphone Open**, or in
+**Settings › Hotkey**, if you would rather have the indicator only while
+dictating — at the cost of the first fraction of a second of each utterance.
+
+macOS keeps the orange indicator lit for a few seconds after any app releases
+the microphone, so switching this off and watching the menu bar looks like
+nothing happened. The line under the menu item reads the real state from
+CoreAudio and says **Microphone: open** or **Microphone: closed**.
 
 ### Models
 

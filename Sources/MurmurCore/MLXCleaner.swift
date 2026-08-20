@@ -45,11 +45,11 @@ public actor MLXCleaner: TranscriptCleaner {
             allCases.first { $0.modelID == modelID }
         }
 
-        /// Qwen3 reasons before answering, emitting a `<think>` block that is
-        /// not part of the cleaned text. Suppressing it with `/no_think` makes
-        /// the model lazy — it echoes the input back — so the reasoning is left
-        /// on and stripped from the reply instead. That needs a higher token
-        /// budget, since the thinking is spent before the answer begins.
+        /// Qwen3 emits a `<think>` block before answering, which is not part
+        /// of the cleaned text. Whether it is allowed to fill that block is a
+        /// separate decision — see `Reasoning`, which defaults to suppressing
+        /// it. This flag only says the model has the machinery, so it is worth
+        /// measuring both ways.
         public var reasons: Bool {
             switch self {
             case .qwen3_4b, .qwen3_1_7b: true
@@ -57,7 +57,9 @@ public actor MLXCleaner: TranscriptCleaner {
             }
         }
 
-        /// Token budget for one cleanup, including any reasoning.
+        /// Token budget when reasoning is allowed to run. A cleanup answer is
+        /// 9–27 tokens; the rest of this exists only to hold the `<think>`
+        /// block, and measured at 96–100% of the reply it usually does.
         public var maximumTokens: Int {
             reasons ? 1024 : 320
         }
@@ -73,12 +75,49 @@ public actor MLXCleaner: TranscriptCleaner {
         }
     }
 
+    /// Whether a reasoning model is allowed to think before answering.
+    ///
+    /// Qwen3 accepts `/no_think` as an in-prompt switch. It is a measurable
+    /// choice rather than a fixed property of the model, so it is settable:
+    /// reasoning is where a cleanup pass spends almost all of its time, and
+    /// the trade against quality has to be re-measured, not assumed.
+    public enum Reasoning: Sendable {
+        /// Let the model reason, and strip the `<think>` block from the reply.
+        case allowed
+        /// Append `/no_think` to the prompt.
+        case suppressed
+    }
+
+    /// What one generation actually cost, for telling a slow model apart from
+    /// a verbose one. The raw reply is kept intact, `<think>` included,
+    /// because a budget spent entirely on reasoning is invisible once the
+    /// block has been stripped.
+    public struct Stats: Sendable {
+        public let promptTokens: Int
+        public let generatedTokens: Int
+        public let promptMs: Int
+        public let generateMs: Int
+        public let tokensPerSecond: Double
+        /// Tokens inside `<think>`, estimated from its share of the reply.
+        public let thinkingCharacters: Int
+        public let replyCharacters: Int
+    }
+
     private let variant: Variant
+    private let reasoning: Reasoning
     private var container: ModelContainer?
     private var protectedTerms: [VocabularyTerm] = []
 
-    public init(variant: Variant) {
+    /// Reasoning is suppressed by default. Measured on the six cleanup
+    /// samples, Qwen3 4B spent 96–100% of every reply inside `<think>` and
+    /// took 26–111 s; with `/no_think` it generates 13–27 tokens in 2.8–8.3 s
+    /// and produces the same text on five of six. On the sixth the reasoning
+    /// arm exhausted its 1024-token budget without ever reaching an answer, so
+    /// suppressing it was strictly better there — 111 s and nothing usable,
+    /// against 4.8 s and text with fillers and repetitions removed.
+    public init(variant: Variant, reasoning: Reasoning = .suppressed) {
         self.variant = variant
+        self.reasoning = reasoning
     }
 
     // MARK: - Installation
@@ -149,6 +188,22 @@ public actor MLXCleaner: TranscriptCleaner {
         protectedTerms = terms
     }
 
+    /// Qwen3's in-prompt switch, placed on the user turn because the last
+    /// occurrence in the conversation is the one that takes effect.
+    private var promptSuffix: String {
+        guard variant.reasons, reasoning == .suppressed else { return "" }
+        return " /no_think"
+    }
+
+    /// A model that has been told not to think does not need the budget that
+    /// thinking required, and leaving it high would hide a regression: a
+    /// `/no_think` that silently failed would still fit its reasoning inside
+    /// 1024 tokens and only show up as time.
+    private var tokenBudget: Int {
+        guard variant.reasons, reasoning == .suppressed else { return variant.maximumTokens }
+        return 320
+    }
+
     public func clean(_ text: String, level: CleanupLevel) async throws -> String {
         guard level != .off else { return text }
         try await prepare()
@@ -161,9 +216,10 @@ public actor MLXCleaner: TranscriptCleaner {
         let session = ChatSession(
             container,
             instructions: instructions(for: level),
-            generateParameters: .init(maxTokens: variant.maximumTokens)
+            generateParameters: .init(maxTokens: tokenBudget)
         )
-        let reply = try await session.respond(to: FoundationModelsCleaner.wrap(text))
+        let reply = try await session.respond(
+            to: FoundationModelsCleaner.wrap(text) + promptSuffix)
 
         return CleanupGuard.accept(
             original: text,
@@ -190,13 +246,15 @@ public actor MLXCleaner: TranscriptCleaner {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Both the model's raw reply and the guarded result, for diagnosing which
-    /// of the two changed the text.
+    /// The model's raw reply, the guarded result, and what the generation
+    /// cost. Used by `--testcleanup-mlx` to tell three different failures
+    /// apart: a model that is slow, a model that is verbose, and a model that
+    /// spent its whole budget reasoning and never reached an answer.
     public func cleanDetailed(
         _ text: String,
         level: CleanupLevel
-    ) async throws -> (raw: String, accepted: String) {
-        guard level != .off else { return (text, text) }
+    ) async throws -> (raw: String, accepted: String, stats: Stats?) {
+        guard level != .off else { return (text, text, nil) }
         try await prepare()
         guard let container else {
             throw CleanupError.unavailable("\(variant.repositoryID) is not loaded.")
@@ -204,19 +262,57 @@ public actor MLXCleaner: TranscriptCleaner {
         let session = ChatSession(
             container,
             instructions: instructions(for: level),
-            generateParameters: .init(maxTokens: variant.maximumTokens)
+            generateParameters: .init(maxTokens: tokenBudget)
         )
-        let reply = try await session.respond(to: FoundationModelsCleaner.wrap(text))
+
+        var reply = ""
+        var stats: Stats?
+        let stream = session.streamDetails(to: FoundationModelsCleaner.wrap(text) + promptSuffix)
+        for try await item in stream {
+            switch item {
+            case .chunk(let chunk):
+                reply += chunk
+            case .info(let info):
+                stats = Stats(
+                    promptTokens: info.promptTokenCount,
+                    generatedTokens: info.generationTokenCount,
+                    promptMs: Int(info.promptTime * 1000),
+                    generateMs: Int(info.generateTime * 1000),
+                    tokensPerSecond: info.tokensPerSecond,
+                    thinkingCharacters: Self.thinkingCharacters(reply),
+                    replyCharacters: reply.count)
+            default:
+                break
+            }
+        }
+
         let stripped = Self.stripReasoning(reply)
         return (
-            stripped,
+            reply,
             CleanupGuard.accept(
                 original: text,
                 cleaned: stripped,
                 level: level,
                 knownTerms: protectedTerms.map(\.text)
-            )
+            ),
+            stats
         )
+    }
+
+    /// Characters enclosed in `<think>`, counting an unclosed block to the end
+    /// of the reply — that is the case worth seeing, since it means the budget
+    /// ran out before the answer began.
+    static func thinkingCharacters(_ reply: String) -> Int {
+        var total = 0
+        var cursor = reply.startIndex
+        while let open = reply.range(of: "<think>", range: cursor..<reply.endIndex) {
+            let close = reply.range(of: "</think>", range: open.upperBound..<reply.endIndex)
+            let stop = close?.upperBound ?? reply.endIndex
+            total += reply.distance(from: open.lowerBound, to: stop)
+            guard close != nil else { break }
+            cursor = stop
+        }
+        return total
     }
 
     private func instructions(for level: CleanupLevel) -> String {

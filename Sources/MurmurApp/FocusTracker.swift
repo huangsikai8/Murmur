@@ -12,11 +12,15 @@ enum FocusTracker {
     struct Target {
         let application: NSRunningApplication?
         let bundleIdentifier: String?
+        /// Shown on the overlay, so the card can name where the words are going.
+        let applicationName: String?
     }
 
     static func capture() -> Target {
         let app = NSWorkspace.shared.frontmostApplication
-        return Target(application: app, bundleIdentifier: app?.bundleIdentifier)
+        return Target(
+            application: app, bundleIdentifier: app?.bundleIdentifier,
+            applicationName: app?.localizedName)
     }
 
     /// Brings the original application back to the front if focus moved away.

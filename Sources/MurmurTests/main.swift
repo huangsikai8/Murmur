@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Foundation
 import MurmurCore
@@ -218,7 +219,8 @@ await runner.test("the previous clipboard is restored afterwards") {
     pasteboard.clearContents()
     pasteboard.setString("user's original clipboard", forType: .string)
 
-    let inserter = ClipboardPasteInserter(pasteboard: pasteboard, restoreDelay: 0.05, paste: {})
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { true })
     try inserter.insert("Okay, it actually displays correctly.")
     runner.expectEqual(
         pasteboard.string(forType: .string),
@@ -234,7 +236,8 @@ await runner.test("restore is skipped when the clipboard changed meanwhile") {
     pasteboard.clearContents()
     pasteboard.setString("old clipboard", forType: .string)
 
-    let inserter = ClipboardPasteInserter(pasteboard: pasteboard, restoreDelay: 0.2, paste: {})
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.2, paste: {}, canReceiveText: { true })
     try inserter.insert("transcript text")
 
     // The user copies something during the restore window.
@@ -253,12 +256,80 @@ await runner.test("all clipboard types are preserved, not just plain text") {
     item.setString("<b>rich</b>", forType: .html)
     pasteboard.writeObjects([item])
 
-    let inserter = ClipboardPasteInserter(pasteboard: pasteboard, restoreDelay: 0.05, paste: {})
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { true })
     try inserter.insert("dictated sentence")
 
     try await Task.sleep(for: .milliseconds(400))
     runner.expectEqual(pasteboard.string(forType: .string), "plain text")
     runner.expectEqual(pasteboard.string(forType: .html), "<b>rich</b>")
+}
+
+// Dictating with nothing focused used to lose the sentence outright: the
+// transcript went onto the clipboard, the paste landed nowhere, and the restore
+// put the old clipboard back over it a third of a second later.
+await runner.test("with nothing focused the transcript stays on the clipboard") {
+    let pasteboard = NSPasteboard(name: .init("murmur.test.fallback"))
+    pasteboard.clearContents()
+    pasteboard.setString("user's original clipboard", forType: .string)
+
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { false })
+    let outcome = try inserter.insert("the sentence that had nowhere to go")
+    runner.expectEqual(outcome, .leftOnClipboard)
+
+    // Well past the restore delay: the transcript must still be there.
+    try await Task.sleep(for: .milliseconds(400))
+    runner.expectEqual(
+        pasteboard.string(forType: .string), "the sentence that had nowhere to go")
+}
+
+await runner.test("a focused field reports pasted and restores the clipboard") {
+    let pasteboard = NSPasteboard(name: .init("murmur.test.outcome"))
+    pasteboard.clearContents()
+    pasteboard.setString("original", forType: .string)
+
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { true })
+    runner.expectEqual(try inserter.insert("landed"), .pasted)
+
+    try await Task.sleep(for: .milliseconds(400))
+    runner.expectEqual(pasteboard.string(forType: .string), "original")
+}
+
+runner.suite("Voice commands")
+
+await runner.test("scratch that is recognized however the recognizer punctuates it") {
+    for spoken in ["scratch that", "Scratch that.", "SCRATCH THAT!", "  scratch   that  "] {
+        runner.expectEqual(
+            VoiceCommand.parse(spoken), .scratchThat, "not recognized: \(spoken)")
+    }
+    // What the recognizer really returns, which is not always what was said.
+    runner.expectEqual(VoiceCommand.parse("Scratched."), .scratchThat)
+    runner.expectEqual(VoiceCommand.parse("Scratch!"), .scratchThat)
+    runner.expectEqual(VoiceCommand.parse("delete that"), .scratchThat)
+    runner.expectEqual(VoiceCommand.parse("undo that"), .scratchThat)
+}
+
+// Deleting is destructive, so the phrase has to be the whole utterance. Someone
+// talking about scratching something must never lose their last sentence.
+await runner.test("the phrase inside a sentence is not a command") {
+    runner.expectEqual(
+        VoiceCommand.parse("I had to scratch that idea completely"), nil)
+    runner.expectEqual(VoiceCommand.parse("scratch that plan and start again"), nil)
+    runner.expectEqual(VoiceCommand.parse("we should delete that file"), nil)
+    runner.expectEqual(VoiceCommand.parse("ordinary dictation"), nil)
+    runner.expectEqual(VoiceCommand.parse(""), nil)
+}
+
+await runner.test("a retraction removes exactly what was inserted") {
+    let inserter = RecordingInserter()
+    let sentence = "This is the sentence I regret."
+    try inserter.insert(sentence)
+    try inserter.deleteBackward(count: sentence.count)
+
+    runner.expectEqual(inserter.inserted, [sentence])
+    runner.expectEqual(inserter.deletions, [sentence.count])
 }
 
 // MARK: - Cleanup safety
@@ -626,7 +697,7 @@ await runner.test("word lists saved before aliases existed still decode") {
 runner.suite("Model catalog")
 
 await runner.test("both layers offer the expected number of models") {
-    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 6)
+    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 8)
     runner.expectEqual(ModelCatalog.models(in: .correction).count, 5)
 }
 
@@ -908,6 +979,672 @@ await runner.test("marks made before begin are dropped") {
     let tracker = LatencyTracker()
     tracker.mark(.hotkeyDown)
     runner.expect(tracker.elapsedMilliseconds().isEmpty, "recorded a mark before begin()")
+}
+
+// MARK: - Hands-free pre-roll
+
+// Silero confirms speech up to 300 ms after it began (measured by --testvad).
+// Without replaying that audio the first word of every utterance is lost, which
+// is the same class of bug as Moonshine dropping the last word.
+func makeBuffer(frames: AVAudioFrameCount) -> AVAudioPCMBuffer {
+    let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+    buffer.frameLength = frames
+    return buffer
+}
+
+await runner.test("pre-roll keeps at least the detector's confirmation lag") {
+    var preRoll = PreRollBuffer(seconds: 0.5, sampleRate: 16000)
+    // 100 ms buffers, the granularity the microphone tap delivers.
+    for _ in 0..<20 { preRoll.append(makeBuffer(frames: 1600)) }
+
+    let heldSeconds = Double(preRoll.frameCount) / 16000
+    runner.expect(
+        heldSeconds >= 0.3,
+        "kept \(heldSeconds)s, less than the 300 ms worst-case start lag"
+    )
+    runner.expect(heldSeconds <= 0.7, "kept \(heldSeconds)s, far beyond the half second asked for")
+}
+
+await runner.test("pre-roll replays oldest audio first") {
+    var preRoll = PreRollBuffer(capacityFrames: 4800)
+    let first = makeBuffer(frames: 1600)
+    let second = makeBuffer(frames: 1600)
+    preRoll.append(first)
+    preRoll.append(second)
+
+    let drained = preRoll.drain()
+    runner.expectEqual(drained.count, 2)
+    runner.expect(drained.first === first, "replayed out of order")
+    runner.expect(preRoll.frameCount == 0, "drain left audio behind")
+}
+
+await runner.test("pre-roll never grows without bound") {
+    var preRoll = PreRollBuffer(seconds: 0.5, sampleRate: 16000)
+    for _ in 0..<500 { preRoll.append(makeBuffer(frames: 1600)) }
+    runner.expect(
+        preRoll.frameCount <= 8000 + 1600,
+        "held \(preRoll.frameCount) frames after 50 s of audio"
+    )
+}
+
+await runner.test("hands-free silence default matches the measured tuning") {
+    // 500 ms is two 256 ms chunks; 250 ms is one. Values between behave
+    // identically, so the defaults must sit on a boundary that means something.
+    let tuning = VoiceActivityDetector.Tuning()
+    runner.expectEqual(tuning.silenceDuration, 0.5)
+    runner.expect(
+        tuning.minSpeechDuration >= 0.3,
+        "a shorter minimum would let a cough insert text"
+    )
+}
+
+// MARK: - Joining consecutive utterances
+
+// Pausing mid-sentence ends one utterance and starts another, so the text
+// arrives as two pastes. Reported from real use: they landed with no gap.
+await runner.test("consecutive utterances are separated by one space") {
+    var joiner = UtteranceJoiner()
+    runner.expectEqual(joiner.separator(before: "the meeting", target: "app"), "")
+    runner.expectEqual(joiner.separator(before: "is on Thursday", target: "app"), " ")
+}
+
+await runner.test("joining never doubles an existing space") {
+    var joiner = UtteranceJoiner()
+    _ = joiner.separator(before: "the meeting ", target: "app")
+    runner.expectEqual(
+        joiner.separator(before: "is on Thursday", target: "app"), "",
+        "added a space after text that already ended with one")
+
+    var other = UtteranceJoiner()
+    _ = other.separator(before: "the meeting", target: "app")
+    runner.expectEqual(
+        other.separator(before: " is on Thursday", target: "app"), "",
+        "added a space before text that already began with one")
+}
+
+await runner.test("punctuation stays tight against the previous word") {
+    for continuation in [", and then", ". Then", "? Really", "! Yes", "; next"] {
+        var joiner = UtteranceJoiner()
+        _ = joiner.separator(before: "the meeting", target: "app")
+        runner.expectEqual(
+            joiner.separator(before: continuation, target: "app"), "",
+            "pushed \"\(continuation)\" away from the word it belongs to")
+    }
+}
+
+await runner.test("a different field starts fresh") {
+    var joiner = UtteranceJoiner()
+    _ = joiner.separator(before: "the meeting", target: "com.apple.Notes")
+    runner.expectEqual(
+        joiner.separator(before: "is on Thursday", target: "com.tinyspeck.slack"), "",
+        "carried spacing across into a different app")
+}
+
+await runner.test("reset makes the next utterance a fresh start") {
+    var joiner = UtteranceJoiner()
+    _ = joiner.separator(before: "the meeting", target: "app")
+    joiner.reset()
+    runner.expectEqual(joiner.separator(before: "is on Thursday", target: "app"), "")
+}
+
+await runner.test("joining only ever adds a single space, never edits the text") {
+    var joiner = UtteranceJoiner()
+    _ = joiner.separator(before: "hello", target: "app")
+    let separator = joiner.separator(before: "world", target: "app")
+    runner.expect(
+        separator.isEmpty || separator == " ",
+        "produced \"\(separator)\" — only an empty string or one space is allowed")
+}
+
+// MARK: - Deterministic formatting
+
+// The rules that rewrite meaning default to off. Ordinary prose must come out
+// of the default configuration untouched apart from sentence capitalization.
+await runner.test("default formatting leaves reference sentences alone") {
+    let options = SpokenFormatter.Options()
+    for sentence in referenceSentences {
+        runner.expectEqual(
+            SpokenFormatter.format(sentence, options: options), sentence,
+            "default formatting altered a reference sentence")
+    }
+}
+
+await runner.test("the master switch turns everything off") {
+    var options = SpokenFormatter.Options(enabled: false)
+    options.spokenPunctuation = true
+    options.removeFillers = true
+    runner.expectEqual(
+        SpokenFormatter.format("um hello comma world", options: options),
+        "um hello comma world")
+}
+
+await runner.test("spoken punctuation becomes punctuation") {
+    let options = SpokenFormatter.Options()
+    runner.expectEqual(
+        SpokenFormatter.format("hello comma world period", options: options),
+        "Hello, world.")
+    runner.expectEqual(
+        SpokenFormatter.format("is it ready question mark", options: options),
+        "Is it ready?")
+    runner.expectEqual(
+        SpokenFormatter.format("first line new line second line", options: options),
+        "First line\nSecond line")
+}
+
+await runner.test("fillers are dropped only when they stand alone") {
+    let options = SpokenFormatter.Options()
+    runner.expectEqual(
+        SpokenFormatter.format("um so uh the report is done", options: options),
+        "So the report is done")
+    // A filler carrying punctuation would take the punctuation with it.
+    runner.expectEqual(
+        SpokenFormatter.format("well um, that is done", options: options),
+        "Well um, that is done")
+}
+
+await runner.test("years and numbers convert only when asked") {
+    var options = SpokenFormatter.Options()
+    runner.expectEqual(
+        SpokenFormatter.format("it was twenty twenty six", options: options),
+        "It was twenty twenty six",
+        "numbers converted while the rule was off")
+
+    options.numbers = true
+    runner.expectEqual(
+        SpokenFormatter.format("it was twenty twenty six", options: options),
+        "It was 2026")
+    runner.expectEqual(
+        SpokenFormatter.format("back in nineteen eighty four", options: options),
+        "Back in 1984")
+    runner.expectEqual(
+        SpokenFormatter.format("about twenty five people", options: options),
+        "About 25 people")
+    // "One" works as a pronoun and stays a word; every other number word is a
+    // count when it stands alone and converts.
+    runner.expectEqual(
+        SpokenFormatter.format("one of the things", options: options),
+        "One of the things")
+    runner.expectEqual(
+        SpokenFormatter.format("just one more time", options: options),
+        "Just one more time")
+    runner.expectEqual(SpokenFormatter.format("nineteen", options: options), "19")
+    runner.expectEqual(
+        SpokenFormatter.format("nineteen of them left", options: options),
+        "19 of them left")
+    // "One" inside a compound is arithmetic, not a pronoun.
+    runner.expectEqual(
+        SpokenFormatter.format("twenty one people", options: options), "21 people")
+    runner.expectEqual(
+        SpokenFormatter.format("one hundred people", options: options), "100 people")
+
+    // Reported from real dictation: "0.35 s" read aloud came back as words.
+    runner.expectEqual(
+        SpokenFormatter.format("three point five seconds", options: options),
+        "3.5 seconds")
+    // Decimals are spoken digit by digit, so this is 3.14 and not "3.fourteen".
+    runner.expectEqual(
+        SpokenFormatter.format("pi is about three point one four", options: options),
+        "Pi is about 3.14")
+    runner.expectEqual(
+        SpokenFormatter.format("version two point oh five", options: options),
+        "Version 2.05")
+    // "point" without a digit after it keeps its ordinary meaning, so the
+    // decimal rule cannot damage prose that merely contains the word.
+    // The number converts, but "point" stays a word: no digit follows it, so
+    // this is a three-point turn and not 3.0 of anything.
+    runner.expectEqual(
+        SpokenFormatter.format("it was a three point turn", options: options),
+        "It was a 3 point turn")
+    runner.expectEqual(
+        SpokenFormatter.format("at that point I left", options: options),
+        "At that point I left")
+    // A decimal is a figure however small its whole part, so the guard that
+    // keeps "one of the things" as prose must not reject this.
+    runner.expectEqual(
+        SpokenFormatter.format("one point five times", options: options),
+        "1.5 times")
+
+    // A date came out half in digits and half in letters: the year converted,
+    // the day did not, because a small standalone number reads as prose.
+    runner.expectEqual(
+        SpokenFormatter.format("nineteen august twenty twenty six", options: options),
+        "19 August 2026")
+    runner.expectEqual(
+        SpokenFormatter.format("august nineteen", options: options),
+        "August 19")
+    runner.expectEqual(
+        SpokenFormatter.format("nineteen of them left", options: options),
+        "19 of them left")
+
+    // Reported from real dictation: this came out as "2000 and sixteen".
+    runner.expectEqual(
+        SpokenFormatter.format("two thousand and sixteen", options: options), "2016")
+    runner.expectEqual(
+        SpokenFormatter.format("one hundred and five", options: options), "105")
+    runner.expectEqual(
+        SpokenFormatter.format("two thousand sixteen", options: options), "2016")
+    // "and" is only part of a number after a scale word. Two separate figures
+    // joined by a conjunction must stay two figures.
+    runner.expectEqual(
+        SpokenFormatter.format("I ate twenty and thirty", options: options),
+        "I ate 20 and 30")
+    runner.expectEqual(
+        SpokenFormatter.format("two thousand and I left", options: options),
+        "2000 and I left")
+}
+
+await runner.test("currency converts only when asked") {
+    var options = SpokenFormatter.Options()
+    runner.expectEqual(
+        SpokenFormatter.format("it cost five dollars", options: options),
+        "It cost five dollars")
+
+    options.currency = true
+    runner.expectEqual(
+        SpokenFormatter.format("it cost five dollars", options: options), "It cost $5")
+    runner.expectEqual(
+        SpokenFormatter.format("it cost twenty five dollars", options: options),
+        "It cost $25")
+    runner.expectEqual(
+        SpokenFormatter.format("it cost five dollars and fifty cents", options: options),
+        "It cost $5.50")
+}
+
+await runner.test("lists and markdown convert only when asked") {
+    var options = SpokenFormatter.Options()
+    runner.expectEqual(
+        SpokenFormatter.format("bullet buy milk", options: options), "Bullet buy milk")
+
+    options.lists = true
+    runner.expectEqual(SpokenFormatter.format("bullet buy milk", options: options), "- Buy milk")
+
+    options.markdown = true
+    runner.expectEqual(SpokenFormatter.format("heading intro", options: options), "# Intro")
+    runner.expectEqual(
+        SpokenFormatter.format("bold ship it", options: options), "**Ship it**")
+    // Emphasis must close inside the sentence terminator.
+    runner.expectEqual(
+        SpokenFormatter.format("bold ship it.", options: options), "**Ship it**.")
+}
+
+await runner.test("formatting never splits a word") {
+    var options = SpokenFormatter.Options()
+    options.numbers = true
+    options.currency = true
+    options.lists = true
+    options.markdown = true
+    for sentence in referenceSentences {
+        let formatted = SpokenFormatter.format(sentence, options: options)
+        for corruption in ["act ually", "cor rectly", "beca use"] {
+            runner.expect(
+                !formatted.contains(corruption),
+                "formatting split a word in \"\(sentence)\"")
+        }
+    }
+}
+
+// MARK: - Multi-model comparison
+
+runner.suite("Transcript comparison")
+
+await runner.test("identical transcripts are unanimous") {
+    let comparison = TranscriptDiff.compare([
+        .init(label: "a", text: "I think we should ship it on Thursday."),
+        .init(label: "b", text: "I think we should ship it on Thursday."),
+    ])
+    runner.expect(comparison.unanimous, "identical transcripts reported a disagreement")
+    runner.expectEqual(comparison.disagreements, 0)
+}
+
+await runner.test("casing and punctuation alone are not disagreements") {
+    // Two engines writing "Thursday." and "Thursday" heard the same word, and
+    // flagging that would bury the places they really differ.
+    let comparison = TranscriptDiff.compare([
+        .init(label: "a", text: "ship it on Thursday."),
+        .init(label: "b", text: "Ship it on thursday"),
+    ])
+    runner.expect(comparison.unanimous, "punctuation difference counted as a disagreement")
+}
+
+await runner.test("a substituted word is contested in every row") {
+    let comparison = TranscriptDiff.compare([
+        .init(label: "a", text: "ship it on Thursday"),
+        .init(label: "b", text: "ship it on Tuesday"),
+    ])
+    runner.expect(!comparison.unanimous, "a substitution went unreported")
+    for row in comparison.rows {
+        let contested = row.tokens.filter { !$0.agrees }.map(\.text)
+        runner.expectEqual(contested.count, 1, "\(row.label) flagged \(contested)")
+    }
+    let flagged = Set(comparison.rows.flatMap { $0.tokens.filter { !$0.agrees }.map(\.text) })
+    runner.expectEqual(flagged, ["Thursday", "Tuesday"])
+}
+
+await runner.test("agreeing words stay unflagged around a substitution") {
+    let comparison = TranscriptDiff.compare([
+        .init(label: "a", text: "ship it on Thursday"),
+        .init(label: "b", text: "ship it on Tuesday"),
+    ])
+    let first = comparison.rows[0]
+    runner.expectEqual(first.tokens.prefix(3).allSatisfy(\.agrees), true)
+}
+
+await runner.test("an inserted word does not knock the rest out of alignment") {
+    // Substring alignment, not position-by-position: one engine hearing an
+    // extra word must not paint every following word as contested.
+    let comparison = TranscriptDiff.compare([
+        .init(label: "a", text: "ship it on Thursday"),
+        .init(label: "b", text: "ship it on the Thursday"),
+    ])
+    runner.expectEqual(comparison.disagreements, 1, "an insertion misaligned the tail")
+}
+
+await runner.test("an outlier does not become the backbone") {
+    // Whichever transcript is aligned against defines what "agreement" means,
+    // so it must be the typical one rather than the first or the longest.
+    let comparison = TranscriptDiff.compare([
+        .init(label: "outlier", text: "completely different words entirely here"),
+        .init(label: "a", text: "ship it on Thursday"),
+        .init(label: "b", text: "ship it on Thursday"),
+    ])
+    runner.expectEqual(comparison.backbone, "ship it on Thursday")
+}
+
+await runner.test("a single transcript has nothing to disagree with") {
+    let comparison = TranscriptDiff.compare([.init(label: "a", text: "ship it")])
+    runner.expect(comparison.unanimous, "a lone transcript reported a disagreement")
+    runner.expectEqual(comparison.rows.count, 1)
+}
+
+await runner.test("no transcripts produce no rows") {
+    runner.expectEqual(TranscriptDiff.compare([]).rows.count, 0)
+}
+
+await runner.test("comparison preserves the caller's row order") {
+    let comparison = TranscriptDiff.compare([
+        .init(label: "first", text: "ship it"),
+        .init(label: "second", text: "ship it"),
+        .init(label: "third", text: "ship it"),
+    ])
+    runner.expectEqual(comparison.rows.map(\.label), ["first", "second", "third"])
+}
+
+await runner.test("a contested word is flagged in the rows that agree too") {
+    // The disputed word has to sit in one column down the page. Flagging only
+    // the rows that differ makes the majority look unanimous and the minority
+    // look broken, when the whole point is that the word is in question.
+    let comparison = TranscriptDiff.compare([
+        .init(label: "a", text: "we should move the meeting"),
+        .init(label: "b", text: "we should move the meeting"),
+        .init(label: "c", text: "we should unmove the meeting"),
+    ])
+    runner.expectEqual(comparison.disagreements, 3, "the contested column was not marked in every row")
+    for row in comparison.rows {
+        let contested = row.tokens.filter { !$0.agrees }.map(\.text)
+        runner.expectEqual(contested.count, 1, "\(row.label) flagged \(contested)")
+    }
+}
+
+runner.suite("Comparison scheduling")
+
+await runner.test("bubbles sharing a speech model decode the audio once") {
+    // Re-decoding would let variation between two decodes read as a
+    // difference between the cleanup models being compared.
+    let bubbles = [
+        ModelComparison.BubbleConfig(
+            speechModelID: "apple.speechanalyzer",
+            cleanupModelID: "mlx.gemma3-1b", cleanupLevel: .light),
+        ModelComparison.BubbleConfig(
+            speechModelID: "apple.speechanalyzer",
+            cleanupModelID: "mlx.qwen3-1.7b", cleanupLevel: .light),
+    ]
+    let groups = ModelComparison.speechGroups(bubbles)
+    runner.expectEqual(groups.count, 1, "the same speech model was scheduled twice")
+    runner.expectEqual(groups[0].bubbles.count, 2)
+}
+
+await runner.test("each cleanup model is loaded once for all its bubbles") {
+    let bubbles = [
+        ModelComparison.BubbleConfig(
+            speechModelID: "apple.speechanalyzer",
+            cleanupModelID: "mlx.gemma3-1b", cleanupLevel: .light),
+        ModelComparison.BubbleConfig(
+            speechModelID: "moonshine.streaming-small",
+            cleanupModelID: "mlx.gemma3-1b", cleanupLevel: .light),
+    ]
+    let groups = ModelComparison.cleanupGroups(bubbles)
+    runner.expectEqual(groups.count, 1)
+    runner.expectEqual(groups[0].bubbles.count, 2)
+}
+
+await runner.test("groups keep first-appearance order") {
+    let bubbles = [
+        ModelComparison.BubbleConfig(speechModelID: "moonshine.streaming-small"),
+        ModelComparison.BubbleConfig(speechModelID: "apple.speechanalyzer"),
+        ModelComparison.BubbleConfig(speechModelID: "moonshine.streaming-small"),
+    ]
+    runner.expectEqual(
+        ModelComparison.speechGroups(bubbles).map(\.modelID),
+        ["moonshine.streaming-small", "apple.speechanalyzer"])
+}
+
+await runner.test("cleanup at level off loads no model") {
+    // Selecting a cleanup model and leaving the level at Off would otherwise
+    // load gigabytes of weights to return the text unchanged.
+    let bubbles = [
+        ModelComparison.BubbleConfig(
+            speechModelID: "apple.speechanalyzer",
+            cleanupModelID: "mlx.gemma3-1b", cleanupLevel: .off),
+        ModelComparison.BubbleConfig(speechModelID: "apple.speechanalyzer"),
+    ]
+    runner.expectEqual(ModelComparison.cleanupGroups(bubbles).count, 0)
+    runner.expectEqual(bubbles[0].wantsCleanup, false)
+    runner.expectEqual(bubbles[1].wantsCleanup, false)
+}
+
+await runner.test("an unknown cleanup model resolves to nothing, not to Apple's") {
+    // The same rule as SpeechEngineFactory: a silent substitution here would
+    // compare a model against itself and report the two as equally good.
+    runner.expect(
+        ModelComparison.cleaner(for: "mlx.not-a-real-model") == nil,
+        "an unknown cleanup model silently fell back to a working cleaner")
+    runner.expect(
+        ModelComparison.cleaner(for: ModelCatalog.appleCorrectionID) != nil,
+        "Apple's cleanup model did not resolve")
+}
+
+await runner.test("every catalog cleanup model resolves to a cleaner") {
+    // A model offered in a bubble picker that resolves to nil would show an
+    // error instead of a comparison.
+    for descriptor in ModelCatalog.models(in: .correction) {
+        runner.expect(
+            ModelComparison.cleaner(for: descriptor.id) != nil,
+            "no cleanup engine implements \(descriptor.id)")
+    }
+}
+
+runner.suite("Cleanup deadline")
+
+await runner.test("work that finishes inside the deadline returns its value") {
+    let value = await withDeadline(.seconds(5)) { "cleaned" }
+    runner.expectEqual(value, "cleaned")
+}
+
+await runner.test("waiting stops at the deadline, not when the work finishes") {
+    // The bug this exists for: cleanup has no bound of its own, and insertion
+    // is serialized behind it, so one runaway pass held up every utterance
+    // after it. Returning nil promptly is the whole fix — 75 s was measured.
+    let started = ContinuousClock.now
+    let value = await withDeadline(.milliseconds(50)) { () -> String? in
+        try? await Task.sleep(for: .seconds(30))
+        return "far too late"
+    }
+    let waited = ContinuousClock.now - started
+    runner.expect(value == nil, "an overrunning pass was not abandoned")
+    runner.expect(
+        waited < .seconds(5),
+        "waited \(waited) for a 50 ms deadline — the work was awaited after all")
+}
+
+await runner.test("work finishing after it was abandoned resumes nothing") {
+    // Both racers resume the same continuation, and resuming one twice is a
+    // crash rather than a failed assertion.
+    let value = await withDeadline(.milliseconds(20)) { () -> String? in
+        try? await Task.sleep(for: .milliseconds(120))
+        return "late"
+    }
+    runner.expect(value == nil, "the deadline did not win")
+    // Long enough for the abandoned work to finish and try to resume.
+    try? await Task.sleep(for: .milliseconds(300))
+}
+
+runner.suite("Turn detection features")
+
+await runner.test("the 8 s window keeps the end of speech at the end") {
+    // Short audio is padded at the *front*. The model was trained to judge the
+    // trailing edge, so padding the other way would hand it silence to judge.
+    let short = [Float](repeating: 0.5, count: 1000)
+    let fitted = WhisperFeatures.fit(short)
+    runner.expectEqual(fitted.count, WhisperFeatures.sampleCount)
+    runner.expectEqual(fitted[0], 0)
+    runner.expectEqual(fitted[WhisperFeatures.sampleCount - 1], 0.5)
+}
+
+await runner.test("audio longer than the window keeps its tail") {
+    var long = [Float](repeating: 0.1, count: WhisperFeatures.sampleCount + 5000)
+    long[long.count - 1] = 0.9
+    let fitted = WhisperFeatures.fit(long)
+    runner.expectEqual(fitted.count, WhisperFeatures.sampleCount)
+    runner.expectEqual(fitted[WhisperFeatures.sampleCount - 1], 0.9)
+}
+
+await runner.test("log-mel matches the reference feature extractor") {
+    // The one failure mode with no symptom: wrong features produce a confident
+    // number rather than an error, so the model would simply be wrong. These
+    // constants come from WhisperFeatureExtractor(chunk_length: 8) with
+    // do_normalize, run on the same signal.
+    // Broadband noise from an integer generator, for two reasons. Every value
+    // is exactly representable, so this and the reference build the identical
+    // input — a sine differs in the last bits between Float32 and float64. And
+    // it fills every mel bin: a tone or a square wave leaves ~87% of the
+    // spectrogram sitting on the `max - 8` floor, where a tiny difference in
+    // the global peak shifts thousands of clamped values at once and the sum
+    // moves 0.04% while the port is perfectly correct.
+    var signal = [Float](repeating: 0, count: WhisperFeatures.sampleCount)
+    var state = 12345
+    for index in 0..<WhisperFeatures.sampleCount {
+        state = (state &* 1103515245 &+ 12345) & 0x7FFF_FFFF
+        signal[index] = Float(state % 5) * 0.25 - 0.5
+    }
+    let features = WhisperFeatures().extract(signal)
+    runner.expectEqual(features.count, WhisperFeatures.melBins * WhisperFeatures.frameCount)
+
+    let sum = features.reduce(0, +)
+    let minimum = features.min() ?? 0
+    let maximum = features.max() ?? 0
+    // Float32 accumulation over 64000 values, so this is a tolerance on the
+    // sum rather than an equality.
+    runner.expect(abs(sum - 71198.2656) < 1.0, "sum was \(sum), expected 71198.27")
+    runner.expect(abs(minimum - 0.258106) < 1e-3, "min was \(minimum)")
+    runner.expect(abs(maximum - 1.384561) < 1e-3, "max was \(maximum)")
+}
+
+await runner.test("the detector window is the model's input length") {
+    // HandsFreeSession caps its rolling buffer with this constant. If the two
+    // ever disagree the model is handed the wrong span of audio.
+    runner.expectEqual(WhisperFeatures.sampleCount, 8 * 16000)
+    runner.expectEqual(WhisperFeatures.frameCount, 800)
+    runner.expectEqual(WhisperFeatures.melBins, 80)
+}
+
+// MARK: - Startup audio hand-off
+
+// The microphone opens before the recognizer is ready, so the audio captured in
+// between is held and replayed. Every one of these failures is silent: the
+// level meter is computed upstream in AudioCapture, so the overlay still moves
+// and the card still says it is listening while the engine is fed nothing.
+
+runner.suite("Startup audio hand-off")
+
+await runner.test("audio captured before the recognizer is ready is replayed in order") {
+    let engine = RecordingEngine()
+    let startup = StartupAudioBuffer()
+
+    for frames in [100, 200, 300] as [AVAudioFrameCount] {
+        startup.append(makeBuffer(frames: frames))
+    }
+    startup.attach(engine)
+
+    runner.expectEqual(engine.appendedFrames, [100, 200, 300])
+}
+
+await runner.test("audio captured after the hand-off reaches the engine") {
+    let engine = RecordingEngine()
+    let startup = StartupAudioBuffer()
+
+    startup.append(makeBuffer(frames: 100))
+    startup.attach(engine)
+    // The whole rest of the utterance takes this path — everything the
+    // speaker says after roughly the first 50 ms.
+    startup.append(makeBuffer(frames: 200))
+    startup.append(makeBuffer(frames: 300))
+
+    runner.expectEqual(engine.appendedFrames, [100, 200, 300])
+}
+
+await runner.test("replayed audio is not delivered twice") {
+    let engine = RecordingEngine()
+    let startup = StartupAudioBuffer()
+
+    startup.append(makeBuffer(frames: 100))
+    startup.attach(engine)
+    startup.append(makeBuffer(frames: 200))
+
+    runner.expectEqual(engine.appendedFrames, [100, 200])
+}
+
+// The regression. `startPipeline` creates the hand-off, installs it in the
+// audio tap, attaches the engine and returns; from then on the tap is its only
+// owner. Capturing it weakly there deallocated it the moment that function
+// returned, so every buffer after the recognizer was ready went nowhere and
+// every transcript came back empty.
+await runner.test("the tap keeps the hand-off alive after the caller returns") {
+    let engine = RecordingEngine()
+    let tap = TapHolder()
+
+    func startPipeline() {
+        let startup = StartupAudioBuffer()
+        tap.install { buffer in startup.append(buffer) }
+        startup.attach(engine)
+    }
+    startPipeline()
+
+    tap.deliver(makeBuffer(frames: 512))
+    tap.deliver(makeBuffer(frames: 512))
+
+    runner.expectEqual(
+        engine.appendedFrames, [512, 512],
+        "the hand-off did not survive the function that installed it")
+}
+
+await runner.test("removing the tap releases the hand-off") {
+    // The other side of holding it strongly: the session must not leave the
+    // engine reachable forever. `AudioCapture.stop()` removes the tap, and
+    // that has to be the last reference.
+    weak var observed: StartupAudioBuffer?
+    let tap = TapHolder()
+
+    do {
+        let startup = StartupAudioBuffer()
+        observed = startup
+        tap.install { buffer in startup.append(buffer) }
+    }
+    runner.expect(observed != nil, "the tap should hold it for the session")
+
+    tap.remove()
+    runner.expect(observed == nil, "removing the tap should release it")
 }
 
 exit(runner.finish())

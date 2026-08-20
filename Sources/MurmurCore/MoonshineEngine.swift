@@ -105,6 +105,8 @@ public actor MoonshineEngine: SpeechRecognitionEngine {
         try await install()
     }
 
+    public nonisolated var biasesTowardPhrases: Bool { true }
+
     public func setContextualPhrases(_ phrases: [String]) async {
         keyterms = phrases
         // Applied on the next session; the transcriber takes them globally.

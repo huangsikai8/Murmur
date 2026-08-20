@@ -67,6 +67,17 @@ if [ -d "$MLX_BUNDLE" ]; then
     cp -R "$MLX_BUNDLE" "$APP/Contents/Resources/"
 fi
 
+# The app icon. Murmur is LSUIElement so it never appears in the Dock, but the
+# icon is still what identifies it in Privacy & Security, the microphone
+# permission prompt, Login Items and notifications — without one all of those
+# show a blank page. Regenerate with `swift scripts/make-icon.swift`; the build
+# only copies the committed product.
+if [ -f "$ROOT/Resources/Murmur.icns" ]; then
+    cp "$ROOT/Resources/Murmur.icns" "$APP/Contents/Resources/Murmur.icns"
+else
+    echo "    warning: Resources/Murmur.icns missing; run scripts/make-icon.swift" >&2
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -76,6 +87,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>Murmur</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key><string>Murmur</string>
+    <key>CFBundleIconFile</key><string>Murmur</string>
+    <key>CFBundleIconName</key><string>Murmur</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
@@ -108,3 +121,25 @@ fi
 
 codesign --verify --verbose=1 "$APP" 2>&1 | sed 's/^/    /'
 echo "==> Built $APP"
+
+# Relaunch, because a rebuilt bundle changes nothing until the resident
+# menu-bar app is restarted. Murmur has no Dock icon and no window, so an old
+# build looks exactly like a new one — a whole evening was spent testing
+# features against a process that predated them. Set MURMUR_NO_LAUNCH=1 to
+# build without touching what is running.
+if [ "${MURMUR_NO_LAUNCH:-0}" = "1" ]; then
+    echo "==> Not relaunching (MURMUR_NO_LAUNCH=1)"
+else
+    if pgrep -x Murmur >/dev/null 2>&1; then
+        echo "==> Quitting the running Murmur"
+        # Ask politely first so it can tear down its event tap and hotkeys.
+        osascript -e 'quit app "Murmur"' >/dev/null 2>&1 || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            pgrep -x Murmur >/dev/null 2>&1 || break
+            sleep 0.2
+        done
+        pgrep -x Murmur >/dev/null 2>&1 && pkill -x Murmur
+    fi
+    open "$APP"
+    echo "==> Relaunched $(basename "$APP")"
+fi

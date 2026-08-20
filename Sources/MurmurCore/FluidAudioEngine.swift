@@ -15,11 +15,30 @@ public actor FluidAudioEngine: SpeechRecognitionEngine {
     public enum Variant: String, Sendable, CaseIterable {
         case parakeetEou
         case nemotron
+        /// Nemotron at NVIDIA's trained 1.12 s chunk. Same weights family as
+        /// `.nemotron`, half the wait between partials, and a separate
+        /// download — the tiers are distinct repositories.
+        case nemotronFast
+        /// The lowest-latency tier. Furthest from the 1.12 s chunk the model
+        /// was trained on, so accuracy is the thing to watch here.
+        case nemotronFastest
 
         public var modelID: String {
             switch self {
             case .parakeetEou: "nvidia.parakeet-realtime-eou-120m"
             case .nemotron: "nvidia.nemotron-streaming-en-0.6b"
+            case .nemotronFast: "nvidia.nemotron-streaming-en-0.6b-1120ms"
+            case .nemotronFastest: "nvidia.nemotron-streaming-en-0.6b-560ms"
+            }
+        }
+
+        /// How much speech accumulates before the recognizer emits new text.
+        var nemotronChunk: NemotronChunkSize? {
+            switch self {
+            case .nemotron: .ms2240
+            case .nemotronFast: .ms1120
+            case .nemotronFastest: .ms560
+            case .parakeetEou: nil
             }
         }
 
@@ -32,10 +51,15 @@ public actor FluidAudioEngine: SpeechRecognitionEngine {
         /// that another app may already have downloaded.
         public var cacheFolderName: String { cacheFolder }
 
+        /// Includes the latency tier, because FluidAudio stores every tier in
+        /// a sibling folder under one parent. Checking the parent would report
+        /// a tier as installed whenever any other tier had been downloaded.
         var cacheFolder: String {
             switch self {
             case .parakeetEou: "parakeet-eou-streaming"
-            case .nemotron: "nemotron-streaming"
+            case .nemotron: "nemotron-streaming/2240ms"
+            case .nemotronFast: "nemotron-streaming/1120ms"
+            case .nemotronFastest: "nemotron-streaming/560ms"
             }
         }
     }
@@ -72,8 +96,9 @@ public actor FluidAudioEngine: SpeechRecognitionEngine {
         let folder = modelsDirectory.appendingPathComponent(variant.cacheFolder, isDirectory: true)
         guard let contents = try? FileManager.default.subpathsOfDirectory(atPath: folder.path)
         else { return false }
-        // FluidAudio stores one subfolder per latency tier; any populated tier
-        // means the model is usable.
+        // For variants whose folder already names a tier this looks only at
+        // that tier. Parakeet EOU still points at its parent, where any
+        // populated tier means the model is usable.
         return contents.contains { $0.hasSuffix(".mlmodelc") || $0.hasSuffix(".json") }
     }
 
@@ -115,7 +140,8 @@ public actor FluidAudioEngine: SpeechRecognitionEngine {
         let created: any StreamingAsrManager =
             switch variant {
             case .parakeetEou: StreamingEouAsrManager()
-            case .nemotron: StreamingNemotronAsrManager()
+            case .nemotron, .nemotronFast, .nemotronFastest:
+                StreamingNemotronAsrManager(requestedChunkSize: variant.nemotronChunk)
             }
         try await created.loadModels()
         manager = created

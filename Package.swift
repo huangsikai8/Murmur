@@ -18,6 +18,12 @@ let package = Package(
         .package(url: "https://github.com/moonshine-ai/moonshine-swift", branch: "main"),
     ],
     targets: [
+        // ONNX Runtime C API headers only. The implementation is already in the
+        // binary: moonshine-swift's static library embeds ORT 1.23.0 and
+        // exports its C entry points, so smart-turn runs on that runtime
+        // without adding a second copy. Requesting ORT_API_VERSION 23 matches
+        // the embedded build exactly.
+        .target(name: "COnnxRuntime"),
         .target(
             name: "MurmurCore",
             dependencies: [
@@ -29,6 +35,7 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "MoonshineVoice", package: "moonshine-swift"),
+                "COnnxRuntime",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

@@ -20,6 +20,13 @@ public final class LatencyTracker: @unchecked Sendable {
 
     private static let log = Logger(subsystem: "com.sikaihuang.murmur", category: "latency")
 
+    /// Where the breakdown is written in addition to the console.
+    ///
+    /// `print` goes nowhere when LaunchServices starts the app, and os_log at
+    /// `.debug` is not persisted, so the timings existed but could not be read
+    /// back from a real session. The app points this at its own log file.
+    public nonisolated(unsafe) static var sink: (@Sendable (String) -> Void)?
+
     private let lock = NSLock()
     private var marks: [(Mark, ContinuousClock.Instant)] = []
     private var origin: ContinuousClock.Instant?
@@ -45,7 +52,7 @@ public final class LatencyTracker: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let origin else { return [] }
         return marks.map { mark, instant in
-            (mark.rawValue, Double((instant - origin).components.attoseconds) / 1e15)
+            (mark.rawValue, (instant - origin) / .milliseconds(1))
         }
     }
 
@@ -55,12 +62,17 @@ public final class LatencyTracker: @unchecked Sendable {
         guard let a = marks.first(where: { $0.0 == start })?.1,
               let b = marks.first(where: { $0.0 == end })?.1
         else { return nil }
-        return Double((b - a).components.attoseconds) / 1e15
+        return (b - a) / .milliseconds(1)
     }
 
-    /// Emits the timing breakdown. No-op outside debug builds.
+    /// Emits the timing breakdown.
+    ///
+    /// The console half is debug-only, but the sink is not: it is the only way
+    /// these numbers survive a real session, since `print` goes nowhere under
+    /// LaunchServices. Gating the sink too meant a release build recorded no
+    /// push-to-talk timings at all — the exact gap this instrumentation exists
+    /// to close.
     public func report() {
-        #if DEBUG
         let rows = elapsedMilliseconds()
         guard !rows.isEmpty else { return }
         var lines = ["[murmur] latency breakdown (ms from hotkey down)"]
@@ -85,7 +97,9 @@ public final class LatencyTracker: @unchecked Sendable {
         }
         let message = lines.joined(separator: "\n")
         Self.log.debug("\(message, privacy: .public)")
+        #if DEBUG
         print(message)
         #endif
+        Self.sink?(message)
     }
 }

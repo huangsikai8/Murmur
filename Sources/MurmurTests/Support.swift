@@ -1,4 +1,6 @@
+import AVFoundation
 import Foundation
+import MurmurCore
 
 /// Thread-safe capture boxes for the injected paste closures.
 final class Counter: @unchecked Sendable {
@@ -34,4 +36,65 @@ final class Box: @unchecked Sendable {
             lock.unlock()
         }
     }
+}
+
+/// Stands in for `AudioCapture`'s tap. It owns the buffer handler and nothing
+/// else owns it back, which is the ownership the real audio path has: the tap
+/// is installed on the input node and outlives the function that installed it.
+final class TapHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+
+    func install(_ handler: @escaping @Sendable (AVAudioPCMBuffer) -> Void) {
+        lock.lock()
+        self.handler = handler
+        lock.unlock()
+    }
+
+    /// One buffer arriving from the microphone.
+    func deliver(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        let handler = self.handler
+        lock.unlock()
+        handler?(buffer)
+    }
+
+    /// What `AudioCapture.stop()` does: removes the tap, which is the only
+    /// thing keeping anything captured in the handler alive.
+    func remove() {
+        lock.lock()
+        handler = nil
+        lock.unlock()
+    }
+}
+
+/// A speech engine that records what it was handed, in order. Frame counts are
+/// enough to tell replayed audio from dropped audio without comparing samples.
+final class RecordingEngine: SpeechRecognitionEngine, @unchecked Sendable {
+    static let engineName = "Recording"
+
+    private let lock = NSLock()
+    private var frames: [AVAudioFrameCount] = []
+
+    var appendedFrames: [AVAudioFrameCount] {
+        lock.lock()
+        defer { lock.unlock() }
+        return frames
+    }
+
+    func preferredInputFormat() async -> AVAudioFormat? { nil }
+    func prepare() async throws {}
+    func beginSession() async throws -> AsyncStream<TranscriptUpdate> {
+        AsyncStream { $0.finish() }
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        frames.append(buffer.frameLength)
+        lock.unlock()
+    }
+
+    func finishSession() async throws -> String { "" }
+    func cancelSession() async {}
+    func releaseModels() async {}
 }

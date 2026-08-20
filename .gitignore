@@ -6,3 +6,4 @@ build/
 .xcbuild.log
 tools/MetallibBuilder/.build-xc/
 .metallib.log
+Resources/Murmur.iconset/

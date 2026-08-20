@@ -104,6 +104,12 @@ final class OverlayModel: ObservableObject {
         case listening
         case transcribing
         case cleaning
+        /// Nothing could receive the text, so it went to the clipboard.
+        case copiedToClipboard
+        /// The last insertion was taken back.
+        case scratched
+        /// There was nothing left that could be taken back.
+        case nothingToScratch
         case error(String)
     }
 
@@ -206,6 +212,9 @@ private struct OverlayView: View {
         case .listening: .red
         case .transcribing: .orange
         case .cleaning: .blue
+        case .copiedToClipboard: .yellow
+        case .scratched: .green
+        case .nothingToScratch: .gray
         case .error: .gray
         }
     }
@@ -215,6 +224,9 @@ private struct OverlayView: View {
         case .listening: "Listening…"
         case .transcribing: "Transcribing…"
         case .cleaning: "Cleaning up…"
+        case .copiedToClipboard: "No text field focused — copied to clipboard"
+        case .scratched: "Scratched"
+        case .nothingToScratch: "Nothing to scratch"
         case .error(let message): message
         }
     }

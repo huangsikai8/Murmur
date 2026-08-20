@@ -36,6 +36,8 @@ public actor AppleSpeechEngine: SpeechRecognitionEngine {
     }
 
     /// Replaces the recognition bias list. Takes effect on the next dictation.
+    public nonisolated var biasesTowardPhrases: Bool { true }
+
     public func setContextualPhrases(_ phrases: [String]) {
         contextualPhrases = phrases
     }

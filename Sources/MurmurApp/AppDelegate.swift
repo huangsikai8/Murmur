@@ -16,8 +16,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBar?.applyPreferences()
         Log.write("status item created")
 
-        hotkeyMonitor.onPress = { [weak controller] in controller?.begin() }
         hotkeyMonitor.onRelease = { [weak controller] in controller?.end() }
+        hotkeyMonitor.mode = Preferences.shared.hotkeyMode
+        // Latch: the first tap starts, the second finishes. Nothing decides the
+        // boundaries but the speaker, so there is no silence threshold to wait
+        // out and no pause that can commit text early.
+        hotkeyMonitor.onToggle = { [weak controller] in
+            guard let controller else { return }
+            if controller.isActive {
+                controller.end()
+            } else {
+                controller.isLatched = true
+                controller.begin()
+            }
+        }
+        hotkeyMonitor.onPress = { [weak controller] in
+            controller?.isLatched = false
+            controller?.begin()
+        }
+        hotkeyMonitor.isDictating = { [weak controller] in controller?.isActive ?? false }
+        hotkeyMonitor.onCancel = { [weak controller] in controller?.cancelActiveSession() }
 
         Task { await bootstrap() }
     }
@@ -25,6 +43,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func bootstrap() async {
         Log.write("bootstrap started")
         // Core ML streaming engines are compiled in, so their models may be offered.
+        LatencyTracker.sink = { Log.write($0) }
+        // Why an utterance went to the clipboard instead of into a field is
+        // otherwise invisible: the answer lives in the accessibility tree of
+        // whatever happened to be frontmost at the time.
+        ClipboardPasteInserter.diagnostics = { Log.write($0) }
         ModelCatalog.coreMLEngineWired = true
         // MLX is compiled in, so the downloadable language models may be offered.
         ModelCatalog.mlxSupported = true

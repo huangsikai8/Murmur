@@ -180,7 +180,40 @@ public enum VocabularyNormalizer {
 
     /// Word-bounded, case-insensitive, with optional whitespace between the
     /// parts of a multi-word term.
+    ///
+    /// Cached, because this runs once per term on every single insertion and a
+    /// term's pattern never changes. Compiling the whole word list again for
+    /// each utterance was pure repeat work on the path between the speaker
+    /// finishing and the text landing.
     static func expression(for phrase: String) -> NSRegularExpression? {
+        if let cached = cache.lookup(phrase) { return cached }
+        guard let built = buildExpression(for: phrase) else { return nil }
+        cache.store(built, for: phrase)
+        return built
+    }
+
+    /// Compiled patterns, keyed by the phrase they were built from. The word
+    /// list is user-sized, so this holds a handful of entries at most.
+    private static let cache = ExpressionCache()
+
+    private final class ExpressionCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [String: NSRegularExpression] = [:]
+
+        func lookup(_ phrase: String) -> NSRegularExpression? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage[phrase]
+        }
+
+        func store(_ expression: NSRegularExpression, for phrase: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            storage[phrase] = expression
+        }
+    }
+
+    private static func buildExpression(for phrase: String) -> NSRegularExpression? {
         let parts = phrase.split(whereSeparator: \.isWhitespace)
         guard !parts.isEmpty else { return nil }
 

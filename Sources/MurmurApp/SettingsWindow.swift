@@ -66,7 +66,14 @@ private struct GeneralSettings: View {
     var body: some View {
         Form {
             Section {
-                Picker("Hold-to-talk key", selection: $preferences.hotkey) {
+                Picker("Dictation key behaviour", selection: $preferences.hotkeyMode) {
+                    ForEach(HotkeyMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .onChange(of: preferences.hotkeyMode) { _, _ in onChange() }
+
+                Picker("Dictation key", selection: $preferences.hotkey) {
                     ForEach(Hotkey.allCases, id: \.self) { key in
                         Text(key.displayName).tag(key)
                     }
@@ -81,12 +88,120 @@ private struct GeneralSettings: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 }
+                Toggle("Keep the microphone open between dictations", isOn: $preferences.keepMicrophoneArmed)
+                    .onChange(of: preferences.keepMicrophoneArmed) { _, _ in onChange() }
+                Text(
+                    "Opening the microphone takes up to a third of a second, and that "
+                        + "audio is not delayed \u{2014} it is never recorded. Leaving it open "
+                        + "makes a press cost nothing, at the price of the orange "
+                        + "microphone indicator staying lit. Nothing is transcribed or "
+                        + "kept unless you start a dictation."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+                Picker("Hands-free toggle", selection: $preferences.handsFreeToggleShortcut) {
+                    ForEach(ToggleShortcut.allCases) { shortcut in
+                        Text(shortcut.displayName).tag(shortcut)
+                    }
+                }
+                .onChange(of: preferences.handsFreeToggleShortcut) { _, _ in onChange() }
+
+                Text(
+                    "Switches continuous dictation on and off from anywhere. This "
+                        + "chord is claimed exclusively, so the app in front will not "
+                        + "act on it as well."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
             } header: {
                 Text("Hotkey")
             } footer: {
-                Text("Hold the key to dictate, release to insert. It never toggles.")
+                Text(
+                    "Holding the key dictates while it is down. Tapping to start "
+                        + "and stop also ends on Return, which is swallowed only "
+                        + "while a dictation is actually running."
+                )
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Dictate continuously", isOn: $preferences.handsFreeEnabled)
+                    .onChange(of: preferences.handsFreeEnabled) { _, _ in onChange() }
+
+                Picker(
+                    "End a sentence after",
+                    selection: $preferences.handsFreeSilenceMilliseconds
+                ) {
+                    // The detector rounds up to 256 ms chunks, so these are the
+                    // only values that behave differently. Waits are measured.
+                    Text("250 ms — text appears in ~0.7 s").tag(250)
+                    Text("500 ms — text appears in ~1.0 s").tag(500)
+                    Text("750 ms — text appears in ~1.2 s").tag(750)
+                }
+                .onChange(of: preferences.handsFreeSilenceMilliseconds) { _, _ in onChange() }
+                .disabled(!preferences.handsFreeEnabled)
+
+                Picker("Switch off after silence", selection: $preferences.handsFreeIdleMinutes) {
+                    Text("Never").tag(0)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("2 hours").tag(120)
+                }
+                .onChange(of: preferences.handsFreeIdleMinutes) { _, _ in onChange() }
+                .disabled(!preferences.handsFreeEnabled)
+            } header: {
+                Text("Hands-free")
+            } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(
+                        "The microphone stays open and every sentence is inserted "
+                            + "where the cursor is. Press Escape to discard the sentence "
+                            + "you are speaking."
+                    )
+                    Label(
+                        "Anything audible is dictated, including other people. "
+                            + "The menu bar icon is filled while this is on.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(.orange)
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Say \u{201C}scratch that\u{201D} to undo", isOn: $preferences.scratchEnabled)
+                    .onChange(of: preferences.scratchEnabled) { _, _ in onChange() }
+
+                Picker("Stop allowing it after", selection: $preferences.scratchWindowSeconds) {
+                    Text("15 seconds").tag(15)
+                    Text("30 seconds").tag(30)
+                    Text("1 minute").tag(60)
+                    Text("5 minutes").tag(300)
+                }
+                .onChange(of: preferences.scratchWindowSeconds) { _, _ in onChange() }
+                .disabled(!preferences.scratchEnabled)
+            } header: {
+                Text("Undo by voice")
+            } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(
+                        "Said on its own, it deletes the sentence just inserted. "
+                            + "Said inside a sentence it is dictated normally, so "
+                            + "\u{201C}I had to scratch that idea\u{201D} is safe."
+                    )
+                    Label(
+                        "It deletes by pressing Delete, and cannot tell whether the "
+                            + "cursor has moved. A shorter window is safer if you type "
+                            + "between sentences.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(.orange)
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
             }
 
             Section("Accidental presses") {
@@ -117,8 +232,56 @@ private struct CleanupSettings: View {
 
     private var unavailableReason: String? { FoundationModelsCleaner.unavailableReason }
 
+    /// One indented sub-switch under the master toggle. Every rule trades away
+    /// some literal speech, so each is named with the phrase it consumes.
+    @ViewBuilder
+    private func rule(_ title: String, _ example: String, _ value: Binding<Bool>) -> some View {
+        Toggle(isOn: value) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(example).font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.leading, 16)
+        .disabled(!preferences.formatting.enabled)
+        .onChange(of: value.wrappedValue) { _, _ in onChange() }
+    }
+
     var body: some View {
         Form {
+            Section {
+                Toggle(
+                    "Clean up dictation automatically",
+                    isOn: $preferences.formatting.enabled
+                )
+                .onChange(of: preferences.formatting.enabled) { _, _ in onChange() }
+
+                rule(
+                    "Apply spoken punctuation", "“new line”, “comma”, “period”",
+                    $preferences.formatting.spokenPunctuation)
+                rule("Remove filler words", "“um”, “uh”", $preferences.formatting.removeFillers)
+                rule(
+                    "Numbers and years", "“twenty twenty six” → 2026",
+                    $preferences.formatting.numbers)
+                rule("Currency", "“five dollars” → $5", $preferences.formatting.currency)
+                rule(
+                    "Spoken lists", "“bullet buy milk” → - buy milk",
+                    $preferences.formatting.lists)
+                rule(
+                    "Markdown commands", "“heading intro”, “bold ship it”",
+                    $preferences.formatting.markdown)
+            } header: {
+                Text("Formatting")
+            } footer: {
+                Text(
+                    "Free, instant, on-device: capitalizes sentences and tidies spacing "
+                        + "and punctuation. No internet required. Numbers, currency, lists, "
+                        + "and markdown are off by default so they never touch ordinary prose."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+
             Section("Correction strength") {
                 ForEach(CleanupLevel.allCases) { level in
                     HStack(alignment: .top, spacing: 10) {

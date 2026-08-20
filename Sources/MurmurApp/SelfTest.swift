@@ -38,7 +38,7 @@ enum SelfTest {
             print("  FAILED: \(error.localizedDescription)")
             return 1
         }
-        print("  ready in \(milliseconds(since: prepareStart)) ms\n")
+        print("  ready in \(SpeechFixture.milliseconds(since: prepareStart)) ms\n")
 
         // A nil preferred format means the engine resamples internally, so the
         // file's own format is passed straight through.
@@ -107,7 +107,7 @@ enum SelfTest {
         engine: any SpeechRecognitionEngine,
         format: AVAudioFormat?
     ) async throws -> Outcome {
-        let audioURL = try synthesize(sentence)
+        let audioURL = try SpeechFixture.synthesize(sentence)
         defer { try? FileManager.default.removeItem(at: audioURL) }
 
         let file = try AVAudioFile(forReading: audioURL)
@@ -117,7 +117,7 @@ enum SelfTest {
         let firstPartial = FirstMark()
         let collector = Task {
             for await update in updates where !update.text.isEmpty {
-                firstPartial.recordIfUnset(milliseconds(since: start))
+                firstPartial.recordIfUnset(SpeechFixture.milliseconds(since: start))
             }
         }
 
@@ -158,32 +158,10 @@ enum SelfTest {
         return Outcome(
             text: text,
             firstPartialMs: firstPartial.value ?? -1,
-            finalizeMs: milliseconds(since: releaseTime)
+            finalizeMs: SpeechFixture.milliseconds(since: releaseTime)
         )
     }
 
-    /// Renders text to a 16 kHz mono float WAV using the system speech synthesizer.
-    private static func synthesize(_ text: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("murmur-selftest-\(UUID().uuidString).wav")
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        process.arguments = [
-            "--file-format=WAVE", "--data-format=LEI16@16000",
-            "-o", url.path, text,
-        ]
-        try process.run()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
-            throw NSError(
-                domain: "Murmur.SelfTest", code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "`say` failed to synthesize audio"]
-            )
-        }
-        return url
-    }
 
     /// Comparison that ignores casing and trailing punctuation differences the
     /// recognizer may legitimately choose differently.
@@ -193,9 +171,6 @@ enum SelfTest {
             .filter { !$0.isPunctuation && !$0.isWhitespace }
     }
 
-    private static func milliseconds(since instant: ContinuousClock.Instant) -> Int {
-        Int(Double((ContinuousClock.now - instant).components.attoseconds) / 1e15)
-    }
 }
 
 /// Records only the first value it is given.
