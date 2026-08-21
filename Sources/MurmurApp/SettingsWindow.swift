@@ -88,6 +88,20 @@ private struct GeneralSettings: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 }
+                Picker("Listening indicator", selection: $preferences.meterStyle) {
+                    ForEach(MeterStyle.allCases) { style in
+                        Text(style.displayName).tag(style)
+                    }
+                }
+                .onChange(of: preferences.meterStyle) { _, _ in onChange() }
+                Text(
+                    preferences.meterStyle.summary
+                        + " Shown while a model that only produces text on release is "
+                        + "listening; the others show the words themselves instead."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
                 Toggle("Keep the microphone open between dictations", isOn: $preferences.keepMicrophoneArmed)
                     .onChange(of: preferences.keepMicrophoneArmed) { _, _ in onChange() }
                 Text(

@@ -105,6 +105,15 @@ final class DictationController {
     /// dictated as ordinary text, which is what someone who never uses the
     /// command would expect of it.
     var scratchEnabled = true
+
+    /// How the input meter is drawn, and — since only one style needs it —
+    /// whether the frequency analysis runs at all.
+    var meterStyle: MeterStyle = .waveform {
+        didSet {
+            overlay.setMeterStyle(meterStyle)
+            capture.analysesSpectrum = meterStyle.needsSpectrum
+        }
+    }
     private var overlayVisible = false
     private var overlayGateTask: Task<Void, Never>?
 
@@ -116,7 +125,11 @@ final class DictationController {
     /// This gates the **overlay only**. Audio is still captured, still fed to
     /// the recognizer, and still transcribed and inserted; nothing about
     /// detection changes.
-    private static let overlaySpeechLevel: Float = 0.35
+    /// Roughly -33 dBFS on `AudioCapture`'s curve, which is quiet speech.
+    /// Recalibrated with that curve rather than left alone: the same number
+    /// means a different loudness every time the curve moves, and the failure
+    /// it guards against — the card appearing for room noise — is silent.
+    private static let overlaySpeechLevel: Float = 0.2
     private var lastSpeechAt = ContinuousClock.now
     private var idleTask: Task<Void, Never>?
     private var escapeMonitor: Any?
@@ -455,16 +468,26 @@ final class DictationController {
         status = .finishing
         overlay.setState(.transcribing)
         let token = sessionToken
+        // Read on this side of the hop, so it is the instant the key said stop
+        // rather than whenever the task below happens to be scheduled.
+        let spokenThrough = mach_absolute_time()
         Task { [capture] in
             // The tap delivers in buffers, so at the moment the key is struck
             // the last fraction of a second is still in flight. Stopping the
             // microphone right here drops it, which is heard as the final word
             // being clipped — the same defect as a streaming decoder finalizing
             // without trailing audio, at the other end of the utterance.
-            let wait = self.trailingCaptureWait
-            if wait > .zero {
-                try? await Task.sleep(for: wait)
-            }
+            //
+            // Waited for by asking the buffers rather than by sleeping long
+            // enough to be safe. The two are not the same length: a release
+            // lands uniformly inside a 100 ms buffer, so the sleep that always
+            // covers it is roughly twice the wait that is usually needed, and
+            // every millisecond of the difference is dead time between the
+            // last word and the text appearing. `trailingCaptureWait` stays as
+            // the ceiling — it is now how long to keep believing a buffer is
+            // coming, rather than how long to wait regardless.
+            await capture.waitForAudio(
+                recordedThrough: spokenThrough, timeout: self.trailingCaptureWait)
             // Only if no new session has claimed the microphone in the
             // meantime. `isActive` went false the moment the key said stop, so
             // a second tap inside this window opens a session that this line
@@ -474,27 +497,34 @@ final class DictationController {
         }
     }
 
-    /// Floor for how long the microphone keeps running after the key says stop.
+    /// Floor for how long the microphone may keep running after the key says
+    /// stop.
     ///
-    /// The real wait is `trailingCaptureWait`, which also honours what the tap
-    /// is measured to be doing.
+    /// The real ceiling is `trailingCaptureWait`, which also honours what the
+    /// tap is measured to be doing.
     var trailingCaptureDuration: Duration = .milliseconds(120)
 
     /// Extra margin on top of one tap buffer. Covers the delivery itself and
     /// the hop back onto this actor, neither of which is instant.
     private static let trailingCaptureMargin = Duration.milliseconds(60)
 
-    /// How long the microphone keeps running after the key says stop, so the
-    /// audio already in the tap's buffer still reaches the engine.
+    /// Longest the microphone keeps running after the key says stop, waiting
+    /// for audio the tap has recorded but not yet handed over.
     ///
-    /// It must exceed **one whole tap buffer**: the buffer holding the moment
-    /// the key was struck is not handed over until it has filled, so a shorter
-    /// wait throws that fraction of a second away. `installTap` is asked for
-    /// 1024 frames and ignored — measured with `--testmic`, the tap delivers
-    /// 4800 frames at 48 kHz, so the fixed 120 ms this used to be left 20 ms of
-    /// margin over a 100 ms buffer and nothing at all on a device that buffers
-    /// more. Sized from what the tap actually did rather than from what it was
-    /// asked for. Paid once per utterance, against losing the last word.
+    /// This is a **ceiling, not a duration**: `end()` waits for the buffer
+    /// that covers the release and stops as soon as it arrives, so the wait
+    /// actually paid is whatever was left of that buffer — measured, 0-100 ms
+    /// against this 160 ms. Sleeping the whole of it, which is what this used
+    /// to do, spent the average utterance ~110 ms of silence for nothing.
+    ///
+    /// It must still exceed **one whole tap buffer**, because that is the
+    /// longest a covering buffer can honestly take to arrive: the buffer
+    /// holding the moment the key was struck is not handed over until it has
+    /// filled. `installTap` is asked for 1024 frames and ignored — measured
+    /// with `--testmic`, the tap delivers 4800 frames at 48 kHz, so the fixed
+    /// 120 ms this used to be left 20 ms of margin over a 100 ms buffer and
+    /// nothing at all on a device that buffers more. Sized from what the tap
+    /// actually did rather than from what it was asked for.
     var trailingCaptureWait: Duration {
         let observed = capture.observedBufferSeconds
         guard observed > 0 else { return trailingCaptureDuration }
@@ -845,7 +875,8 @@ final class DictationController {
         if let target { await FocusTracker.restore(target) }
         do {
             let inserted = separator + transcript
-            let outcome = try inserter.insert(inserted)
+            let outcome = try inserter.insert(
+                inserted, into: target?.application?.processIdentifier)
             if outcome == .leftOnClipboard {
                 // Nothing could take the text, so it is on the clipboard rather
                 // than lost. Say so: silence here reads as the app having
@@ -853,6 +884,13 @@ final class DictationController {
                 joiner.reset()
                 lastInsertion = nil
                 announceClipboardFallback()
+            } else if outcome == .pastedUnverified {
+                // The paste almost certainly landed — it just could not be
+                // confirmed, so nothing is claimed on the card. Scratch is
+                // given up rather than risk deleting text this app did not
+                // insert; the joiner carries on, since the words are there.
+                lastInsertion = nil
+                Log.write("focus unreadable; pasted anyway and kept a clipboard copy")
             } else {
                 lastInsertion = LastInsertion(
                     text: inserted, bundleIdentifier: target?.bundleIdentifier,
@@ -1008,11 +1046,32 @@ final class DictationController {
     private func startMeter() {
         guard !engineStreamsLiveText else { return }
         meterTask?.cancel()
+        // The tap hands over one buffer per 100 ms holding four 25 ms slices,
+        // so draining it and drawing whatever came back moves the meter four
+        // bars at a time, ten times a second — which is not a fast meter, it is
+        // a stuttering one. The slices are queued and released one per tick
+        // instead, so the bars scroll at 40 a second the way they were
+        // measured. The queue costs up to a tick of delay and never more,
+        // because it is drained faster than it fills whenever it runs behind.
         meterTask = Task { [weak self] in
+            var pending: [LevelSample] = []
             while !Task.isCancelled {
                 guard let self else { return }
-                overlay.pushLevel(capture.currentLevel)
-                try? await Task.sleep(for: .milliseconds(50))
+                pending.append(contentsOf: capture.drainLevelSamples())
+
+                // A backlog is time, not just bars: 12 slices is 300 ms of
+                // meter that would arrive late. Drop the oldest rather than
+                // show speech that has already finished.
+                if pending.count > 12 { pending.removeFirst(pending.count - 12) }
+
+                if !pending.isEmpty {
+                    // Two at a time while catching up, one when level. Any
+                    // faster and the catch-up is itself a visible jump.
+                    let release = pending.count > 5 ? 2 : 1
+                    overlay.push(Array(pending.prefix(release)))
+                    pending.removeFirst(min(release, pending.count))
+                }
+                try? await Task.sleep(for: .milliseconds(25))
             }
         }
     }
@@ -1094,8 +1153,12 @@ final class DictationController {
 
         if let focusTarget { await FocusTracker.restore(focusTarget) }
         do {
-            let outcome = try inserter.insert(transcript)
+            let outcome = try inserter.insert(
+                transcript, into: focusTarget?.application?.processIdentifier)
             if outcome == .leftOnClipboard { announceClipboardFallback() }
+            if outcome == .pastedUnverified {
+                Log.write("focus unreadable; pasted anyway and kept a clipboard copy")
+            }
         } catch {
             NSLog("[murmur] insertion failed: \(error.localizedDescription)")
         }

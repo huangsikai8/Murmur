@@ -16,6 +16,9 @@ let package = Package(
         // Moonshine streaming ASR. Its C++ core embeds ONNX Runtime, so no
         // separate runtime dependency is needed.
         .package(url: "https://github.com/moonshine-ai/moonshine-swift", branch: "main"),
+        // Whisper on Core ML. Pure Swift with no binary targets, so it does not
+        // hit the duplicate `module.modulemap` that keeps this build on SwiftPM.
+        .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.1.0"),
     ],
     targets: [
         // ONNX Runtime C API headers only. The implementation is already in the
@@ -35,6 +38,7 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "MoonshineVoice", package: "moonshine-swift"),
+                .product(name: "WhisperKit", package: "WhisperKit"),
                 "COnnxRuntime",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]

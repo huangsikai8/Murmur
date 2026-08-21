@@ -94,12 +94,21 @@ public actor FluidAudioEngine: SpeechRecognitionEngine {
     /// Whether this variant's weights are already on disk.
     public static func isInstalled(_ variant: Variant) -> Bool {
         let folder = modelsDirectory.appendingPathComponent(variant.cacheFolder, isDirectory: true)
-        guard let contents = try? FileManager.default.subpathsOfDirectory(atPath: folder.path)
-        else { return false }
         // For variants whose folder already names a tier this looks only at
         // that tier. Parakeet EOU still points at its parent, where any
         // populated tier means the model is usable.
-        return contents.contains { $0.hasSuffix(".mlmodelc") || $0.hasSuffix(".json") }
+        //
+        // Enumerated lazily and abandoned at the first hit: listing the whole
+        // tree first means walking hundreds of megabytes of weights to answer a
+        // question the first few entries usually settle.
+        guard let entries = FileManager.default.enumerator(atPath: folder.path) else {
+            return false
+        }
+        for case let path as String in entries
+        where path.hasSuffix(".mlmodelc") || path.hasSuffix(".json") {
+            return true
+        }
+        return false
     }
 
     /// Bytes currently occupied by this variant's cache.

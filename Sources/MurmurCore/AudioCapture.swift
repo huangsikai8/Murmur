@@ -60,6 +60,8 @@ public final class AudioCapture: @unchecked Sendable {
 
     private let levelLock = NSLock()
     private var level: Float = 0
+    private var levelSlices: [Float] = []
+    private let spectrum = SpectrumAnalyser()
 
     /// Recent input loudness, 0...1, for the overlay's meter.
     ///
@@ -71,6 +73,71 @@ public final class AudioCapture: @unchecked Sendable {
         defer { levelLock.unlock() }
         return level
     }
+
+    /// Every level measured since the last call, oldest first.
+    ///
+    /// The meter used to poll `currentLevel` every 50 ms, which cannot show
+    /// more than the tap delivers: buffers arrive every 100 ms, so half the
+    /// bars were duplicates of the one before and the whole meter moved at
+    /// 10 frames a second no matter how it was drawn. One buffer is measured in
+    /// `levelSliceCount` pieces instead, so a syllable inside it is a shape
+    /// rather than a single value.
+    ///
+    /// Drained rather than read, because a bar that is never collected is a
+    /// moment of speech the meter skipped.
+    public func drainLevelSamples() -> [LevelSample] {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        let samples = levelSamples
+        levelSamples.removeAll(keepingCapacity: true)
+        return samples
+    }
+
+    /// Whether each slice is also broken into frequency bands.
+    ///
+    /// Off by default and switched on only by a meter that draws them: the
+    /// analysis is cheap but it is not free, and nothing else in the app has
+    /// any use for it.
+    public var analysesSpectrum: Bool {
+        get {
+            levelLock.lock()
+            defer { levelLock.unlock() }
+            return spectrumWanted
+        }
+        set {
+            levelLock.lock()
+            spectrumWanted = newValue
+            levelLock.unlock()
+        }
+    }
+    private var spectrumWanted = false
+    private var levelSamples: [LevelSample] = []
+
+    public func drainLevels() -> [Float] {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        let slices = levelSlices
+        levelSlices.removeAll(keepingCapacity: true)
+        return slices
+    }
+
+    /// Pieces each buffer is measured in. Four gives ~25 ms per bar on the
+    /// 100 ms buffers this hardware delivers — fine enough to separate
+    /// syllables, coarse enough that the work stays trivial on the audio
+    /// thread.
+    private static let levelSliceCount = 4
+
+    /// Anything quieter than this is silence, anything louder is full scale.
+    ///
+    /// Set from the two ends that matter, both of them wrong once already. The
+    /// original window ran -50 dB to 0 dB — full scale, which dictation never
+    /// reaches, so an ordinary voice at ~-30 dBFS sat in the middle of the
+    /// meter and looked no different from an empty room. Opening the floor to
+    /// -55 to fix that overshot in the other direction: a quiet room is around
+    /// -50 dBFS, so the room itself started moving the bars and the meter
+    /// twitched at nothing. -42 is below speech and above a room.
+    private static let quietDecibels: Float = -42
+    private static let loudDecibels: Float = -12
 
     /// Longest buffer the tap has actually handed over, in seconds.
     ///
@@ -188,12 +255,18 @@ public final class AudioCapture: @unchecked Sendable {
         sinkLock.unlock()
         levelLock.lock()
         level = 0
+        levelSlices.removeAll(keepingCapacity: true)
+        levelSamples.removeAll(keepingCapacity: true)
         levelLock.unlock()
     }
 
     /// Closes the input device and puts the microphone indicator out.
     public func stop() {
         idle()
+        // No further buffer is coming, so anyone waiting for one is waiting
+        // for nothing. Released rather than left to time out: the device
+        // closing is the answer to their question.
+        releaseDeliveryWaiters()
         lock.lock()
         defer { lock.unlock() }
         guard isRunning else { return }
@@ -228,8 +301,9 @@ public final class AudioCapture: @unchecked Sendable {
         let targetFormat = self.targetFormat
 
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.deliver(buffer, converter: converter, targetFormat: targetFormat)
+        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) {
+            [weak self] buffer, when in
+            self?.deliver(buffer, at: when, converter: converter, targetFormat: targetFormat)
         }
         tapInstalled = true
     }
@@ -237,6 +311,7 @@ public final class AudioCapture: @unchecked Sendable {
     /// Runs on the audio thread for every buffer.
     private func deliver(
         _ buffer: AVAudioPCMBuffer,
+        at when: AVAudioTime,
         converter: AVAudioConverter?,
         targetFormat: AVAudioFormat?
     ) {
@@ -253,45 +328,210 @@ public final class AudioCapture: @unchecked Sendable {
         } else {
             outgoing = buffer
         }
+        // Measured from the *incoming* buffer: the conversion changes the
+        // sample rate and the frame count, not the stretch of time the audio
+        // came from.
+        let end = Self.endHostTime(of: buffer, at: when)
 
         sinkLock.lock()
-        defer { sinkLock.unlock() }
         if let sink {
             sink(outgoing)
-            return
+        } else {
+            let wanted = AVAudioFrameCount(
+                (preRollSeconds * outgoing.format.sampleRate).rounded(.up))
+            if idleRoll.capacityFrames != wanted {
+                idleRoll = PreRollBuffer(capacityFrames: wanted)
+            }
+            idleRoll.append(outgoing)
         }
-        let wanted = AVAudioFrameCount(
-            (preRollSeconds * outgoing.format.sampleRate).rounded(.up))
-        if idleRoll.capacityFrames != wanted {
-            idleRoll = PreRollBuffer(capacityFrames: wanted)
+        // Marked only after the hand-off, so a waiter resumed here knows the
+        // audio has already reached the engine rather than merely arrived.
+        deliveredThroughHostTime = max(deliveredThroughHostTime, end)
+        var due: [CheckedContinuation<Void, Never>] = []
+        deliveryWaiters.removeAll { waiter in
+            guard waiter.through <= end else { return false }
+            if let continuation = waiter.continuation {
+                due.append(continuation)
+                waiter.continuation = nil
+            }
+            return true
         }
-        idleRoll.append(outgoing)
+        sinkLock.unlock()
+
+        for continuation in due { continuation.resume() }
+    }
+
+    // MARK: - Waiting for audio that has not been handed over yet
+
+    /// Host time through which the tap has handed audio over.
+    private var deliveredThroughHostTime: UInt64 = 0
+    private var deliveryWaiters: [DeliveryWaiter] = []
+
+    /// One caller waiting for the buffer that covers a particular instant.
+    /// Every field is touched only under `sinkLock`.
+    private final class DeliveryWaiter {
+        let through: UInt64
+        var continuation: CheckedContinuation<Void, Never>?
+        /// Set when the timeout fired before the continuation was installed —
+        /// a real race, since the timer starts first, and without this the
+        /// caller would wait for a resume that is never coming.
+        var expired = false
+        init(through: UInt64) { self.through = through }
+    }
+
+    /// Suspends until the tap has handed over the audio recorded up to
+    /// `hostTime`, or until `timeout` elapses.
+    ///
+    /// The tap delivers a buffer only once it has *filled*, so at the moment a
+    /// key is released the last fraction of a second is still inside the
+    /// device. Waiting for it is not optional — that is the final word of the
+    /// utterance — but what is being waited for is one specific event, and a
+    /// fixed sleep has to be sized for the worst case of it. Measured, the
+    /// buffer is 100 ms and a release lands uniformly inside one, so the wait
+    /// that is always long enough is twice the wait that is usually needed.
+    ///
+    /// Asking the buffers themselves collapses that: the common case returns
+    /// as soon as the covering buffer arrives, and `timeout` only decides how
+    /// long to keep believing one is coming.
+    public func waitForAudio(recordedThrough hostTime: UInt64, timeout: Duration) async {
+        // Nothing will ever be delivered with the device closed, so a caller
+        // would sit out the whole timeout for audio that does not exist.
+        guard isArmed else { return }
+
+        let waiter = DeliveryWaiter(through: hostTime)
+        let timer = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.giveUp(on: waiter)
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            sinkLock.lock()
+            guard deliveredThroughHostTime < hostTime, !waiter.expired else {
+                sinkLock.unlock()
+                continuation.resume()
+                return
+            }
+            waiter.continuation = continuation
+            deliveryWaiters.append(waiter)
+            sinkLock.unlock()
+        }
+        timer.cancel()
+    }
+
+    /// Resumes everyone waiting, whether or not their buffer arrived.
+    private func releaseDeliveryWaiters() {
+        sinkLock.lock()
+        var due: [CheckedContinuation<Void, Never>] = []
+        for waiter in deliveryWaiters {
+            waiter.expired = true
+            if let continuation = waiter.continuation {
+                due.append(continuation)
+                waiter.continuation = nil
+            }
+        }
+        deliveryWaiters.removeAll()
+        sinkLock.unlock()
+        for continuation in due { continuation.resume() }
+    }
+
+    /// Stops waiting for a buffer that has not arrived in time.
+    private func giveUp(on waiter: DeliveryWaiter) {
+        sinkLock.lock()
+        waiter.expired = true
+        let continuation = waiter.continuation
+        waiter.continuation = nil
+        deliveryWaiters.removeAll { $0 === waiter }
+        sinkLock.unlock()
+        continuation?.resume()
+    }
+
+    /// When the audio in `buffer` ends, on the host clock.
+    ///
+    /// `AVAudioTime` stamps the *first* sample, so the end is that plus the
+    /// buffer's own duration. This is the buffer's own account of what it
+    /// covers rather than the clock at delivery, and the two differ by the
+    /// input latency — reading the clock instead would credit a buffer with
+    /// audio recorded after it had already been captured.
+    private static func endHostTime(of buffer: AVAudioPCMBuffer, at when: AVAudioTime) -> UInt64 {
+        guard when.isHostTimeValid, buffer.format.sampleRate > 0 else {
+            return mach_absolute_time()
+        }
+        let seconds = Double(buffer.frameLength) / buffer.format.sampleRate
+        return when.hostTime &+ AVAudioTime.hostTime(forSeconds: seconds)
     }
 
     /// Root-mean-square of the buffer, mapped onto a scale that looks linear
     /// to the eye. Speech sits far too low on a raw amplitude scale to read.
+    ///
+    /// Measured in slices rather than whole, so the meter can show what
+    /// happened *inside* a buffer — see `drainLevels`.
     private func updateLevel(from buffer: AVAudioPCMBuffer) {
         guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
         let seconds =
             buffer.format.sampleRate > 0
             ? Double(buffer.frameLength) / buffer.format.sampleRate : 0
-        // Runs on the audio thread for every buffer, so the mean square is
-        // taken with one vectorized call rather than a scalar loop.
-        var meanSquare: Float = 0
-        vDSP_measqv(channel, 1, &meanSquare, vDSP_Length(buffer.frameLength))
-        let rms = meanSquare.squareRoot()
 
-        // -50 dB reads as silence, 0 dB as full scale.
-        let decibels = 20 * log10(max(rms, 1e-7))
-        let normalized = max(0, min(1, (decibels + 50) / 50))
+        let frames = Int(buffer.frameLength)
+        let sliceLength = max(1, frames / Self.levelSliceCount)
 
         levelLock.lock()
-        // Fall away more slowly than it rises, or the bar flickers between words.
-        level = normalized > level ? normalized : level * 0.82 + normalized * 0.18
+        var start = 0
+        while start < frames {
+            let count = min(sliceLength, frames - start)
+            // Runs on the audio thread for every buffer, so the mean square is
+            // taken with one vectorized call rather than a scalar loop.
+            var meanSquare: Float = 0
+            vDSP_measqv(channel + start, 1, &meanSquare, vDSP_Length(count))
+            let measured = Self.loudness(ofRMS: meanSquare.squareRoot())
+
+            // Rises instantly and falls away over a few slices, or the bar
+            // flickers between words. The coefficient is per 25 ms slice, not
+            // per 100 ms buffer as it used to be, so it decays four times as
+            // often for the same number — 0.82 here is a gentler fall than
+            // 0.82 was, which is what keeps the meter from jittering now that
+            // it is sampled four times as finely.
+            level = measured > level ? measured : level * 0.82 + measured * 0.18
+            levelSlices.append(level)
+            levelSamples.append(
+                LevelSample(
+                    level: level,
+                    bands: spectrumWanted
+                        ? spectrum.bands(
+                            of: channel + start, count: count,
+                            sampleRate: buffer.format.sampleRate)
+                        : []
+                )
+            )
+            start += count
+        }
+        // A meter nobody is draining must not grow without bound — during
+        // push-to-talk with a streaming engine there is no meter at all.
+        if levelSlices.count > Self.maximumBufferedLevels {
+            levelSlices.removeFirst(levelSlices.count - Self.maximumBufferedLevels)
+        }
+        if levelSamples.count > Self.maximumBufferedLevels {
+            levelSamples.removeFirst(levelSamples.count - Self.maximumBufferedLevels)
+        }
         // Never falls: the trailing wait has to cover the worst buffer seen,
         // and a run of short ones does not make the long ones stop happening.
         bufferSeconds = max(bufferSeconds, seconds)
         levelLock.unlock()
+    }
+
+    /// Two seconds of slices, which is more than any meter shows at once.
+    private static let maximumBufferedLevels = 80
+
+    /// Loudness of one RMS reading, 0...1.
+    ///
+    /// Linear in decibels between the two ends, then an S-curve, which is the
+    /// part that makes speaking look different from not speaking: it pushes
+    /// room noise down towards the floor and lifts ordinary speech towards the
+    /// top, instead of leaving both in the middle where they look alike.
+    public static func loudness(ofRMS rms: Float) -> Float {
+        let decibels = 20 * log10(max(rms, 1e-7))
+        let range = loudDecibels - quietDecibels
+        let normalized = max(0, min(1, (decibels - quietDecibels) / range))
+        return normalized * normalized * (3 - 2 * normalized)
     }
 }
 

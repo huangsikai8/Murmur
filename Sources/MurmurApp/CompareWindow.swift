@@ -24,6 +24,7 @@ final class CompareWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         if let window {
+            model.refreshChoices()
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -41,6 +42,13 @@ final class CompareWindowController: NSObject, NSWindowDelegate {
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Anything that installs or deletes a model had to take key focus away from
+    /// this window to do it, so regaining focus is the moment the picker
+    /// contents can have gone stale.
+    func windowDidBecomeKey(_ notification: Notification) {
+        model.refreshChoices()
     }
 
     /// Closing the window is the teardown. Leaving several gigabytes of speech
@@ -92,6 +100,7 @@ final class CompareViewModel: ObservableObject {
 
     init() {
         bubbles = Self.defaultBubbles().map { BubbleState(config: $0) }
+        refreshChoices()
     }
 
     // MARK: Bubbles
@@ -105,7 +114,7 @@ final class CompareViewModel: ObservableObject {
     private static func defaultBubbles() -> [ModelComparison.BubbleConfig] {
         var seen: Set<String> = []
         var chosen: [AIModelDescriptor] = []
-        let ordered = speechChoices.sorted { left, _ in left.id == ModelCatalog.appleSpeechID }
+        let ordered = scanSpeechChoices().sorted { left, _ in left.id == ModelCatalog.appleSpeechID }
         for descriptor in ordered {
             guard let engine = SpeechEngineFactory.engine(for: descriptor.id) else { continue }
             let family = String(describing: type(of: engine))
@@ -117,20 +126,33 @@ final class CompareViewModel: ObservableObject {
         return chosen.prefix(3).map { ModelComparison.BubbleConfig(speechModelID: $0.id) }
     }
 
-    static var speechChoices: [AIModelDescriptor] {
+    private static func scanSpeechChoices() -> [AIModelDescriptor] {
         let installed = ModelCatalog.installedModelIDs()
         return ModelCatalog.models(in: .speechRecognition)
             .filter { $0.id == ModelCatalog.appleSpeechID || installed.contains($0.id) }
     }
 
-    static var cleanupChoices: [AIModelDescriptor] {
+    private static func scanCleanupChoices() -> [AIModelDescriptor] {
         let installed = ModelCatalog.installedModelIDs()
         return ModelCatalog.models(in: .correction)
             .filter { $0.id == ModelCatalog.appleCorrectionID || installed.contains($0.id) }
     }
 
+    /// Held rather than derived per read. Answering "what is installed" walks
+    /// every model cache on disk, and these are read from a bubble's `body`,
+    /// which re-evaluates at the meter's rate while the microphone is recording.
+    @Published private(set) var speechChoices: [AIModelDescriptor] = []
+    @Published private(set) var cleanupChoices: [AIModelDescriptor] = []
+
+    /// The installed set only changes via the Settings Models tab, which cannot
+    /// be reached without this window losing key focus and regaining it.
+    func refreshChoices() {
+        speechChoices = Self.scanSpeechChoices()
+        cleanupChoices = Self.scanCleanupChoices()
+    }
+
     func addBubble() {
-        guard let first = Self.speechChoices.first else { return }
+        guard let first = speechChoices.first else { return }
         let template = bubbles.last?.config
         bubbles.append(
             BubbleState(
@@ -437,7 +459,7 @@ private struct BubbleCard: View {
                     get: { bubble.config.speechModelID },
                     set: { model.update(bubble.id, speechModelID: $0) })
             ) {
-                ForEach(CompareViewModel.speechChoices) { descriptor in
+                ForEach(model.speechChoices) { descriptor in
                     Text(descriptor.name).tag(descriptor.id)
                 }
             }
@@ -451,7 +473,7 @@ private struct BubbleCard: View {
                     set: { model.update(bubble.id, cleanupModelID: $0.isEmpty ? .some(nil) : $0) })
             ) {
                 Text("No cleanup").tag("")
-                ForEach(CompareViewModel.cleanupChoices) { descriptor in
+                ForEach(model.cleanupChoices) { descriptor in
                     Text(descriptor.name).tag(descriptor.id)
                 }
             }

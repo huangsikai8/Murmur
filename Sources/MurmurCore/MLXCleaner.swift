@@ -136,12 +136,16 @@ public actor MLXCleaner: TranscriptCleaner {
 
     public static func isInstalled(_ variant: Variant) -> Bool {
         let folder = cacheFolder(for: variant)
-        guard
-            let entries = FileManager.default.enumerator(atPath: folder.path)?
-                .allObjects as? [String]
-        else { return false }
+        guard let entries = FileManager.default.enumerator(atPath: folder.path) else {
+            return false
+        }
         // Weights present means the model is usable; config alone is not enough.
-        return entries.contains { $0.hasSuffix(".safetensors") }
+        // Consumed lazily rather than through `allObjects`, which bridges every
+        // entry in a multi-gigabyte hub cache into a String before testing any.
+        for case let path as String in entries where path.hasSuffix(".safetensors") {
+            return true
+        }
+        return false
     }
 
     public static func delete(_ variant: Variant) throws {

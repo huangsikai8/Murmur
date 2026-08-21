@@ -102,8 +102,25 @@ frames and delivers 4800 at 48 kHz — 100 ms. That is what sizes the wait after
 the key says stop: the buffer holding the moment of the keystroke is not handed
 over until it has *filled*, so a shorter wait throws that fraction of a second
 away. The fixed 120 ms this used to be left 20 ms of margin and none at all on
-a device that buffers more, so `trailingCaptureWait` is now derived from
+a device that buffers more, so `trailingCaptureWait` is derived from
 `AudioCapture.observedBufferSeconds` plus 60 ms.
+
+**But that length is a worst case, and sleeping it spent the difference.** A
+release lands uniformly inside a 100 ms buffer, so the wait that is always long
+enough is about twice the wait usually needed, and the surplus is dead time
+between the last word and the text appearing. `end()` now awaits
+`AudioCapture.waitForAudio(recordedThrough:timeout:)`, which resumes when the
+tap hands over a buffer whose audio actually reaches the moment of the release,
+with `trailingCaptureWait` demoted to the ceiling. Measured with `--testmic`,
+8 releases: **9-110 ms, median 78 ms** against the flat 160 ms — ~82 ms off
+every push-to-talk release, on every engine. The buffer's own `AVAudioTime` is
+what says how far it reaches, not the clock at delivery: the two differ by the
+input latency, and reading the clock would credit a buffer with audio recorded
+after it was already captured. That is also why a release occasionally waits
+past 100 ms — the first buffer to arrive did not yet cover the key, so it
+correctly waited for the next one. `--testmic` asserts both halves: every wait
+returns with a buffer, and audio that can never arrive still gives up at the
+ceiling rather than hanging the dictation.
 
 **A session's teardown outlives its key.** The microphone runs on past `end()`
 for the trailing capture while `isActive` is already false, so a second tap
@@ -111,6 +128,57 @@ inside that window opens a session whose device the *previous* session's
 pending stop then closes — in a latch that is one tap, and the whole utterance
 after it is silent. `sessionToken` makes the pending stop a no-op once someone
 else has claimed the microphone.
+
+**A meter cannot be smoother than the rate it is fed, and draining is not
+pacing.** The tap delivers one buffer per 100 ms holding four 25 ms slices, so
+draining the queue every 25 ms and drawing whatever came back moves the meter
+four bars at once, ten times a second — finer data, identical stutter. The
+slices are queued in `startMeter` and released one per tick, two while catching
+up, and dropped beyond 300 ms of backlog, since a late bar is speech that has
+already finished. The bars are also drawn without an implicit animation on
+purpose: `ForEach` is keyed by position, so a scrolling meter is not bars
+moving, it is each bar taking its neighbour's height, and animating that
+interpolates every bar towards the one beside it — which smears the waveform and
+pays for 28 interpolations every 25 ms to do it.
+
+**Meter styles are five drawings of the same measurement.** `MeterStyle` picks
+between the scrolling waveform (default), a centre-weighted pulse, real
+frequency bands, bouncing bars, and the iOS 9 Siri wave. All five are handed the
+same measured loudness, draw inside the same fixed 165x22 box, and never resize
+the card. Only `.spectrum` costs anything extra — a 512-point FFT per slice
+through `SpectrumAnalyser` — and `DictationController.meterStyle` switches
+`AudioCapture.analysesSpectrum` off for the other four, so nothing is computed
+for a meter nobody is drawing. `.lively`'s per-bar drift is the one piece of
+invented motion in the app; it multiplies the measured level rather than adding
+to it, so it can still only move when there is sound. The band edges are
+asserted by a test that plays a tone at each band's own centre frequency and
+requires that band to be the loudest — a bin/band mapping that is off by one
+still moves with your voice and looks perfectly plausible on screen.
+
+**A level scale has two ends and both can be wrong.** The meter's window ran
+-50 dB to 0 dB — full scale, which dictation never reaches, so an ordinary voice
+at ~-30 dBFS sat mid-meter and looked no different from an empty room. Opening
+the floor to -55 dB overshot the other way: a quiet room is about -50 dBFS, so
+the room itself moved the bars and the meter twitched at nothing. -42 to -12 dB
+with an S-curve puts a room flat on the floor and speech across the top half.
+`overlaySpeechLevel` has to be recalibrated every time that window moves, since
+the same number means a different loudness on each curve, and the failure it
+guards — the card appearing for room noise — is silent.
+
+**The level meter cannot be more responsive than the tap.** `installTap`
+delivers one buffer per 100 ms, so polling `currentLevel` every 50 ms — which is
+what the meter did — produced pairs of identical bars and a meter that moved at
+10 frames a second however it was drawn. `updateLevel` measures each buffer in
+four slices and `drainLevels()` hands over every one, so a bar is 25 ms and a
+syllable is a shape. The scale matters as much as the rate: the old mapping ran
+-50 dB to 0 dB — full scale, which dictation never reaches — so an ordinary
+voice at ~-30 dBFS and an empty room both sat in the middle and looked alike.
+The window is -55 to -12 dB with an S-curve, which puts the room on the floor
+and speech at the top. All of this is display only: `currentLevel` feeds the
+meter, the hands-free card gate and the compare window, and nothing else, so
+none of it can affect a transcript. `overlaySpeechLevel` had to be recalibrated
+with it — the same 0.35 means -32.5 dB on the old scale and -40 dB on this one,
+so leaving the number alone would have made the card appear for room noise.
 
 **A detector confirms speech only after it has started.** Silero needs up to
 300 ms (measured, `--testvad`), so continuous dictation keeps a 500 ms pre-roll
@@ -159,6 +227,19 @@ lives in `MurmurCore`, not nested in `DictationController`, so
 directly. The wiring in `startPipeline` remains uncovered: the app target cannot
 be imported.
 
+**The system-wide `AXFocusedUIElement` query does not work on macOS 26.** It
+returns `cannotComplete` in 0 ms — not a timeout, and regardless of what is
+focused; asking the frontmost application directly
+(`AXUIElementCreateApplication(pid)`) answers correctly for the same element in
+the same instant. `describeFocus` read that failure as "nothing focused", which
+made every dictation report "No text field focused — copied to clipboard" while
+the paste was landing normally, and silently clobbered the clipboard each time
+by skipping the restore. It now asks the application as a fallback, and
+separates the three answers: an application that reports no focused element is
+still a real "nothing focused" and still announces, while an unreadable tree is
+`unknown` — pasted, copy kept, nothing claimed on the card. `--testfocus` prints
+which query answered.
+
 **Chunk-based engines only decode when asked.** `finish()` on FluidAudio's EOU
 manager returns an empty string unless `processBufferedAudio()` ran first.
 
@@ -193,6 +274,56 @@ rather than disabled. `barHeights` is duplicated between the glyph and
 `scripts/make-icon.swift` and has to be changed in both.
 
 ## Model-specific gotchas
+
+* **Whisper is batch, and it invents words rather than returning none.** It
+  decodes a fixed 30-second window, so there is nothing to show while you speak
+  and `WhisperEngine` decodes on release like `ParakeetBatchEngine`. Trained on
+  captioned audio, it fills near-silence with whatever the caption track said
+  next. This is not a tail risk, it is every silent hold — measured with
+  `--testsilence` on Large v3 Turbo, before the guard:
+
+  | hold | returned |
+  | --- | --- |
+  | 2 s digital silence | "you" |
+  | 2 s room tone at -55 dBFS | "." |
+  | 2 s room tone at -45 dBFS | "." |
+  | 6 s room tone at -50 dBFS | "." |
+
+  Apple's recognizer returns nothing for all four, so the test is sound and the
+  behaviour is Whisper's.
+
+* **`noSpeechThreshold` does nothing in WhisperKit, and setting it looks like a
+  fix.** Whisper's own guard for the above is the no-speech probability, and
+  `TextDecoder.swift` contains `let noSpeechProb: Float = 0 // TODO: implement
+  no speech prob`. The gate is `noSpeechProb > threshold`, so it compares 0
+  against 0.6 forever. `WhisperEngine` therefore carries its own three-layer
+  replacement, and each layer is deliberately weaker than it could be, because
+  dropping a real sentence is worse than letting a stray "." through:
+  audio whose loudest 25 ms is below **-45 dBFS** is never decoded at all;
+  output containing no letter or digit is dropped unconditionally; and the
+  stock fillers ("thank you", "you", "thanks for watching") are dropped only
+  as a *whole transcript* and only below **-38 dBFS**, so saying thank you out
+  loud keeps it. Peak, not average: a sentence is mostly gaps, and averaging
+  pulls a real utterance down towards the room it was spoken in.
+* **WhisperKit's variant folders are not a pattern.** `openai_whisper-small.en`
+  next to `openai_whisper-large-v3-v20240930`, which is large-v3-turbo under its
+  release date, and quantized siblings like `openai_whisper-small.en_217MB` sit
+  in the same repository. A folder assembled from the case name would resolve to
+  a *different checkpoint* rather than fail, so `Variant.repositoryFolder` spells
+  each one out and a test asserts the round trip.
+* **WhisperKit downloads to `~/Documents/huggingface` unless told otherwise.**
+  Every variant here passes an explicit `downloadBase` of
+  `~/Library/Application Support/Murmur/Whisper`, which is also what makes
+  install detection and deletion exact. The weights and the tokenizer come from
+  *two* repositories — `argmaxinc/whisperkit-coreml` and `openai/whisper-*` —
+  and only the first reports progress, so the bar stops just short of the end
+  while the last few hundred kilobytes arrive. Both count towards installed: the
+  model cannot decode a token without the tokenizer.
+* **The `.en` checkpoints have no language tokens**, so `DecodingOptions.language`
+  is ignored by them and pins large-v3-turbo, the one multilingual variant
+  offered, to English. Sizes are the sum of the files fetched per folder, not
+  the repository total: Base (English) measured 146 MB on disk against the
+  147 MB the catalog claims, which is what says the method is sound.
 
 * **Qwen3 reasons, and must be told not to.** It emits `<think>…</think>`,
   which is stripped. Letting it think is what the code once did and it is
@@ -348,6 +479,7 @@ swift run MurmurTests                   # 123 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --testmic [iterations]
 ./build/Murmur.app/Contents/MacOS/Murmur --testtail [modelID] [--clip ms]
 ./build/Murmur.app/Contents/MacOS/Murmur --testhandsfree [modelID]
+./build/Murmur.app/Contents/MacOS/Murmur --testsilence [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testhomophones
 ./build/Murmur.app/Contents/MacOS/Murmur --testcompare [seconds] \
     [--say "sentence"] [--cleanup modelID]
@@ -372,6 +504,10 @@ format switch must both drop the stale roll and deliver in the new format.
 finalized with no settle time, which is the latch case. `--testtail --clip 500`
 removes real speech as well and must fail; a tail test that cannot fail says
 nothing.
+
+`--testsilence` holds the key with nobody speaking, in four flavours of room
+tone, and every result must be empty — words there are words nobody said. It
+exists because Whisper produces them and nothing upstream stops it.
 
 `--testcompare` records once and replays that one recording through every
 installed speech model in turn, then prints them side by side with the contested
@@ -402,7 +538,19 @@ models being compared.
 
 Speech, `--selftest`, 4 sentences: Apple SpeechAnalyzer 4/4 (20–24 ms to first
 partial), Nemotron 4/4, Moonshine Small 4/4, Moonshine Medium 4/4, Parakeet TDT
-0.6B v2 4/4, Parakeet EOU 2/4 and unpunctuated.
+0.6B v2 4/4, Whisper Base (English) 4/4, Parakeet EOU 2/4 and unpunctuated.
+
+Whisper Large v3 Turbo is 4/4 as well, and the size is what it costs: 777–884 ms
+to decode a short sentence against 106–157 ms for Base, on the same audio. Base
+also passes `--testtail` 4/4 and `--testhandsfree` 4/4, finalizing in 124 ms
+average / 160 ms worst — comparable to Parakeet TDT, and the two of them are the
+only batch engines here. The first decode after a *download* costs ~2.4 s (Base) or
+1.16 s (Turbo), which is Core ML compiling and specializing the model. This is
+not per session, which is what an earlier note here claimed on the strength of
+one run taken minutes after the download: re-measured warm, Turbo gives
+834/756/865/849 ms and 808/843/797/744 ms with no first-decode spike at all. A
+warm-up pass in `prepare()` would buy nothing. Measured on disk: Base 146 MB,
+Turbo 1569 MB, each including a ~3 MB tokenizer from a second repository.
 
 Parakeet TDT v2 is the one non-streaming entry: it emits nothing while you speak
 and decodes on release, in 81–104 ms for a short sentence, after a 253 ms load.
@@ -415,6 +563,7 @@ Latency budget from the end of speech to text on screen, hands-free, measured:
 | Stage | Cost |
 | --- | --- |
 | Hotkey to microphone, device armed | **0.0-7.3 ms** (was 155-466 ms) |
+| Release to the last buffer, push-to-talk | **9-110 ms, median 78** (was a flat 160) |
 | Detector endpoint (500 ms setting) | ~980 ms |
 | Engine finalize — Parakeet TDT batch | 103 ms |
 | Engine finalize — Apple SpeechAnalyzer | 115 ms |

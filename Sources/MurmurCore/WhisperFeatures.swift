@@ -144,7 +144,14 @@ public struct WhisperFeatures {
         let pad = Self.fftSize / 2
         var padded = [Float](repeating: 0, count: samples.count + 2 * pad)
         for index in 0..<pad { padded[index] = samples[pad - index] }
-        for index in 0..<samples.count { padded[pad + index] = samples[index] }
+        // The centre is a straight copy of every sample; as a subscript loop it
+        // was the whole cost of the padding step.
+        samples.withUnsafeBufferPointer { source in
+            padded.withUnsafeMutableBufferPointer { destination in
+                destination.baseAddress!.advanced(by: pad)
+                    .update(from: source.baseAddress!, count: source.count)
+            }
+        }
         for index in 0..<pad {
             padded[pad + samples.count + index] = samples[samples.count - 2 - index]
         }
@@ -153,14 +160,28 @@ public struct WhisperFeatures {
         // is then two matrix multiplies over the whole spectrogram instead of
         // 800 separate ones. Frame 801 is never built, which is what
         // `log_spec[:, :-1]` drops in the reference.
+        // Built one frame at a time, contiguously, then transposed in one pass.
+        // Writing straight into [fftSize][frames] means each store lands a whole
+        // row away from the last, which costs more than both matrix multiplies
+        // it feeds; this way every operand of every multiply is contiguous.
         let frames = Self.frameCount
         var windowed = [Float](repeating: 0, count: Self.fftSize * frames)
-        for frame in 0..<frames {
-            let start = frame * Self.hopLength
-            for index in 0..<Self.fftSize {
-                windowed[index * frames + frame] = padded[start + index] * window[index]
+        var rowMajor = [Float](repeating: 0, count: Self.fftSize * frames)
+        padded.withUnsafeBufferPointer { source in
+            window.withUnsafeBufferPointer { taper in
+                rowMajor.withUnsafeMutableBufferPointer { destination in
+                    for frame in 0..<frames {
+                        vDSP_vmul(
+                            source.baseAddress! + frame * Self.hopLength, 1,
+                            taper.baseAddress!, 1,
+                            destination.baseAddress! + frame * Self.fftSize, 1,
+                            vDSP_Length(Self.fftSize))
+                    }
+                }
             }
         }
+        vDSP_mtrans(
+            rowMajor, 1, &windowed, 1, vDSP_Length(Self.fftSize), vDSP_Length(frames))
 
         // (201 x 400) * (400 x 800) -> (201 x 800), once for each basis.
         var real = [Float](repeating: 0, count: Self.spectrumBins * frames)

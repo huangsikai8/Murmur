@@ -13,11 +13,13 @@ import MurmurCore
 /// microphone running and the recognizer being ready, ~15 ms; this one is
 /// entirely before it.
 ///
-/// Four measurements:
+/// Five measurements:
 ///   * cold — the device opened on the key, which is what the app did.
 ///   * armed — the device already open, a press only swapping the sink.
 ///   * pre-roll — audio recorded *before* the press, replayed into the session.
 ///   * cadence — how long the tap holds audio, which sizes the trailing wait.
+///   * trailing — what a release actually waits for the last buffer, against
+///     the ceiling it used to sleep through whether or not it had to.
 enum MicTest {
 
     static func run(iterations: Int = 5) async -> Int32 {
@@ -63,6 +65,8 @@ enum MicTest {
         print("")
         let cadence = await reportCadence(capture)
         print("")
+        let trailing = await reportTrailing(capture)
+        print("")
         let switched = await reportFormatSwitch(capture)
         print("")
         let releases = await reportRelease(capture)
@@ -75,7 +79,7 @@ enum MicTest {
         let saved = median(coldStart) - median(armedStart)
         print(String(format: "An armed microphone saves %.0f ms of speech per press.", saved))
 
-        guard preRollOK, cadence, switched, releases else { return 1 }
+        guard preRollOK, cadence, trailing, switched, releases else { return 1 }
         return 0
     }
 
@@ -282,6 +286,83 @@ enum MicTest {
                      observed))
         guard observed >= ms - 0.5 else {
             print("   FAILED: the reported buffer is shorter than the one delivered")
+            return false
+        }
+        return true
+    }
+
+    /// The other end of the utterance: how long a release waits for audio the
+    /// tap has already recorded but not yet handed over.
+    ///
+    /// The wait is not optional — the buffer holding the moment of the
+    /// keystroke is not delivered until it has filled, and that fraction of a
+    /// second is the final word. What is measured here is whether it costs one
+    /// whole buffer every time, which is what sleeping the ceiling did, or
+    /// only the part of the buffer that had not been recorded yet.
+    ///
+    /// Two things have to hold, and only one of them is about speed:
+    ///   * a buffer really does arrive covering the release, so nothing is
+    ///     dropped; and
+    ///   * when one cannot arrive, the ceiling still ends the wait, or a
+    ///     failed device would hang the whole dictation rather than finalize.
+    private static func reportTrailing(_ capture: AudioCapture) async -> Bool {
+        print("── trailing: waiting for the buffer that holds the release")
+        let ceiling = Duration.milliseconds(160)
+        let box = CadenceBox()
+        do {
+            try capture.start { box.record($0) }
+        } catch {
+            print("   FAILED: start() — \(error.localizedDescription)")
+            return false
+        }
+        // Let the tap settle into its cadence before timing anything.
+        try? await Task.sleep(for: .milliseconds(400))
+
+        var waits: [Double] = []
+        var missed = 0
+        for index in 1...8 {
+            let before = box.summary.2
+            let began = ContinuousClock.now
+            await capture.waitForAudio(recordedThrough: mach_absolute_time(), timeout: ceiling)
+            let elapsed = milliseconds(since: began)
+            let delivered = box.summary.2 - before
+            waits.append(elapsed)
+            if delivered < 1 { missed += 1 }
+            print(String(format: "   %d  waited %6.1f ms, %d buffer(s) arrived", index, elapsed,
+                         delivered))
+            // Land the next release at a different point inside a buffer, or
+            // every sample measures the same phase and the average is a lie.
+            try? await Task.sleep(for: .milliseconds(17 * index))
+        }
+        capture.idle()
+
+        report("trailing wait", waits)
+        let ceilingMs = Double(ceiling.components.seconds) * 1000
+            + Double(ceiling.components.attoseconds) / 1e15
+        let saved = ceilingMs - median(waits)
+        print(String(format: "   Sleeping the ceiling instead would cost %.0f ms more per release.",
+                     saved))
+
+        guard missed == 0 else {
+            print("   FAILED: \(missed) wait(s) returned with no buffer — the release was clipped")
+            return false
+        }
+        guard (waits.max() ?? .infinity) <= ceilingMs + 25 else {
+            print("   FAILED: a wait outran the ceiling it is supposed to be bounded by")
+            return false
+        }
+
+        // The failure case: armed, but nothing will ever be delivered that
+        // covers a time in the future. This must end at the ceiling.
+        let began = ContinuousClock.now
+        await capture.waitForAudio(
+            recordedThrough: mach_absolute_time() &+ AVAudioTime.hostTime(forSeconds: 10),
+            timeout: ceiling)
+        let hung = milliseconds(since: began)
+        print(String(format: "   unreachable audio: gave up after %.1f ms (ceiling %.0f)", hung,
+                     ceilingMs))
+        guard hung >= ceilingMs - 25, hung <= ceilingMs + 100 else {
+            print("   FAILED: the ceiling did not end a wait that can never be satisfied")
             return false
         }
         return true

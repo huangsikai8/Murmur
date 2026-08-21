@@ -64,11 +64,21 @@ public protocol SpeechRecognitionEngine: AnyObject, Sendable {
 
     /// Terms to bias recognition toward, so unusual words are actually heard.
     func setContextualPhrases(_ phrases: [String]) async
+
+    /// Whether text appears while you speak, rather than only on release.
+    ///
+    /// Asked of the engine rather than read off the catalog, because the
+    /// catalog is a claim and this is the behaviour. A model wrongly marked
+    /// live shows an empty overlay for the whole hold and reads as broken.
+    nonisolated var streamsLiveText: Bool { get }
 }
 
 extension SpeechRecognitionEngine {
     /// Engines without contextual biasing simply ignore the word list.
     public func setContextualPhrases(_ phrases: [String]) async {}
+
+    /// Most engines emit partials as they go; the batch ones say otherwise.
+    public nonisolated var streamsLiveText: Bool { true }
 
     /// Whether `setContextualPhrases` does anything at all.
     ///
@@ -100,6 +110,9 @@ public enum SpeechEngineFactory {
             return MoonshineEngine(variant: variant)
         }
         if modelID == ParakeetBatchEngine.modelID { return ParakeetBatchEngine() }
+        if let variant = WhisperEngine.Variant.from(modelID: modelID) {
+            return WhisperEngine(variant: variant)
+        }
         return nil
     }
 
@@ -107,8 +120,7 @@ public enum SpeechEngineFactory {
     /// only when the key is released. Derived from the engine that would
     /// actually run, so a catalog entry cannot claim live text it never emits.
     public static func streamsLiveText(for modelID: String) -> Bool? {
-        guard let engine = engine(for: modelID) else { return nil }
-        return !(engine is ParakeetBatchEngine)
+        engine(for: modelID)?.streamsLiveText
     }
 
     /// Speech models whose catalog `streams` flag disagrees with the engine

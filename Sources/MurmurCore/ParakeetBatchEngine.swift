@@ -57,6 +57,9 @@ public actor ParakeetBatchEngine: SpeechRecognitionEngine {
 
     // MARK: - SpeechRecognitionEngine
 
+    /// Decodes on release, so the overlay stays empty during the hold.
+    public nonisolated var streamsLiveText: Bool { false }
+
     /// Parakeet decodes 16 kHz mono, and collecting samples in that form avoids
     /// a conversion pass over the whole utterance at release.
     public func preferredInputFormat() async -> AVAudioFormat? {

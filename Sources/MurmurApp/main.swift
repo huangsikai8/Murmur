@@ -31,12 +31,19 @@ if CommandLine.arguments.contains("--testfocus") {
             print("  \(remaining)…")
             try? await Task.sleep(for: .seconds(1))
         }
-        let focus = ClipboardPasteInserter.describeFocus()
+        let focus = ClipboardPasteInserter.describeFocus(
+            target: NSWorkspace.shared.frontmostApplication?.processIdentifier)
         print("\nfocused element: \(focus.description)")
-        print(
-            focus.acceptsText
-                ? "verdict: text would be pasted here"
-                : "verdict: nothing can take text — the transcript would stay on the clipboard")
+        switch focus.verdict {
+        case .acceptsText:
+            print("verdict: text would be pasted here")
+        case .rejectsText:
+            print("verdict: nothing can take text — the transcript would stay on the clipboard")
+        case .unknown:
+            print(
+                "verdict: focus could not be read — the text would be pasted anyway "
+                    + "and also left on the clipboard, with nothing announced")
+        }
         return 0
     })
 }
@@ -48,6 +55,16 @@ if let index = CommandLine.arguments.firstIndex(of: "--testmic") {
         CommandLine.arguments.count > index + 1
         ? Int(CommandLine.arguments[index + 1]) ?? 5 : 5
     exit(runBlocking { await MicTest.run(iterations: iterations) })
+}
+
+// `--testsilence [modelID]` holds the key and says nothing. Whisper answers
+// silence with words, so this is the test that catches a sentence nobody spoke.
+if let index = CommandLine.arguments.firstIndex(of: "--testsilence") {
+    let modelID =
+        CommandLine.arguments.count > index + 1
+        && !CommandLine.arguments[index + 1].hasPrefix("--")
+        ? CommandLine.arguments[index + 1] : ModelCatalog.appleSpeechID
+    exit(runBlocking { await SilenceTest.run(modelID: modelID) })
 }
 
 if CommandLine.arguments.contains("--testformatting") {

@@ -146,7 +146,7 @@ public struct SpokenFormatter {
             }
 
             if options.spokenPunctuation,
-                let (mark, consumed) = matchPunctuation(tokens, at: index)
+                let (mark, consumed) = matchPunctuation(tokens, at: index, first: word)
             {
                 output.append(mark)
                 index = consumed
@@ -226,10 +226,22 @@ public struct SpokenFormatter {
 
     // MARK: - Matchers
 
-    private static func matchPunctuation(_ tokens: [String], at index: Int) -> (String, Int)? {
-        for (phrase, mark) in punctuationPhrases where phrase.count <= tokens.count - index {
-            let slice = tokens[index..<(index + phrase.count)].map(normalized)
-            if slice == phrase { return (mark, index + phrase.count) }
+    /// `first` is the caller's already-normalized `tokens[index]`. Every phrase
+    /// has to match it at offset 0, so it rules out all but a handful of the
+    /// phrases without normalizing anything, and the rest of the slice is only
+    /// normalized for a phrase that can still match.
+    private static func matchPunctuation(
+        _ tokens: [String], at index: Int, first: String
+    ) -> (String, Int)? {
+        for (phrase, mark) in punctuationPhrases
+        where phrase[0] == first && phrase.count <= tokens.count - index {
+            var matched = true
+            for offset in 1..<phrase.count where normalized(tokens[index + offset]) != phrase[offset]
+            {
+                matched = false
+                break
+            }
+            if matched { return (mark, index + phrase.count) }
         }
         return nil
     }

@@ -1,4 +1,5 @@
 import AppKit
+import MurmurCore
 import SwiftUI
 
 /// Borderless, non-activating panel that shows live transcription.
@@ -43,6 +44,8 @@ final class OverlayPanel {
         model.state = .listening
         model.showsMeter = showsMeter
         model.levels = Array(repeating: 0, count: OverlayModel.meterBarCount)
+        model.level = 0
+        model.bands = Array(repeating: 0, count: SpectrumAnalyser.bandCount)
         model.isActive = true
         reposition()
         panel.orderFrontRegardless()
@@ -50,11 +53,34 @@ final class OverlayPanel {
 
     /// Appends one input-level sample, scrolling the meter leftward.
     func pushLevel(_ value: Float) {
-        guard model.showsMeter else { return }
+        pushLevels([value])
+    }
+
+    /// Appends a run of samples in one go.
+    ///
+    /// The tap hands over several slices at a time, and publishing each one
+    /// separately would lay the card out once per bar for no visible gain.
+    func pushLevels(_ values: [Float]) {
+        push(values.map { LevelSample(level: $0) })
+    }
+
+    /// Appends measurements, with their spectrum when one was taken.
+    func push(_ samples: [LevelSample]) {
+        guard model.showsMeter, !samples.isEmpty else { return }
         var levels = model.levels
-        levels.removeFirst()
-        levels.append(max(0, min(1, value)))
+        levels.append(contentsOf: samples.map { max(0, min(1, $0.level)) })
+        if levels.count > OverlayModel.meterBarCount {
+            levels.removeFirst(levels.count - OverlayModel.meterBarCount)
+        }
         model.levels = levels
+        model.level = levels.last ?? 0
+        if let bands = samples.last?.bands, !bands.isEmpty {
+            model.bands = bands
+        }
+    }
+
+    func setMeterStyle(_ style: MeterStyle) {
+        model.style = style
     }
 
     func update(transcript: String) {
@@ -98,6 +124,57 @@ final class OverlayPanel {
     }
 }
 
+/// How the input meter is drawn while a batch engine is listening.
+///
+/// Only the shape changes: every style is fed the same measured loudness, sits
+/// in the same fixed box, and never resizes the card.
+enum MeterStyle: String, CaseIterable, Identifiable, Codable, Sendable {
+    /// Scrolling history, newest on the right. One bar per 25 ms.
+    case waveform
+    /// One loudness value shaping every bar at once, tallest in the middle.
+    case pulse
+    /// Real frequency bands, each bar moving on its own.
+    case spectrum
+    /// Loudness again, with per-bar drift so the bars do not move in lockstep.
+    case lively
+    /// The iOS 9 Siri wave: overlapping translucent curves.
+    case siri
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .waveform: "Scrolling waveform"
+        case .pulse: "Pulse"
+        case .spectrum: "Frequency bands"
+        case .lively: "Bouncing bars"
+        case .siri: "Siri wave"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .waveform:
+            "The last 0.7 seconds of your voice, scrolling past."
+        case .pulse:
+            "One shape that rises and falls with how loud you are."
+        case .spectrum:
+            "Each bar is a frequency, so vowels and consonants look different."
+        case .lively:
+            "Loudness again, but the bars drift instead of moving together."
+        case .siri:
+            "Overlapping curves that gather in the middle, as in iOS."
+        }
+    }
+
+    /// Whether this style needs the frequency analysis switched on.
+    var needsSpectrum: Bool { self == .spectrum }
+
+    /// Whether this style animates between measurements rather than only when
+    /// a new one arrives.
+    var needsClock: Bool { self == .siri || self == .lively || self == .pulse }
+}
+
 @MainActor
 final class OverlayModel: ObservableObject {
     enum State: Equatable {
@@ -123,6 +200,11 @@ final class OverlayModel: ObservableObject {
     @Published var showsMeter: Bool = false
     /// Recent input levels, oldest first. Real microphone data, not decoration.
     @Published var levels: [Float] = Array(repeating: 0, count: meterBarCount)
+    /// The most recent level on its own, for the styles that draw one value.
+    @Published var level: Float = 0
+    /// Band magnitudes, low frequencies first. Only filled for `.spectrum`.
+    @Published var bands: [Float] = Array(repeating: 0, count: SpectrumAnalyser.bandCount)
+    @Published var style: MeterStyle = .waveform
 }
 
 private struct OverlayView: View {
@@ -194,17 +276,138 @@ private struct OverlayView: View {
         model.showsMeter && model.state == .listening
     }
 
-    private var meter: some View {
-        HStack(alignment: .center, spacing: 3) {
-            ForEach(Array(model.levels.enumerated()), id: \.offset) { _, level in
-                Capsule(style: .continuous)
-                    .fill(Color.red.opacity(0.35 + Double(level) * 0.65))
-                    // A visible floor, so silence still reads as "running".
-                    .frame(width: 3, height: 3 + CGFloat(level) * 19)
+    /// The meter, in whichever shape the speaker chose.
+    ///
+    /// Every style is handed the same measured loudness and draws inside the
+    /// same fixed box — `meterWidth` by `meterHeight` — so switching style
+    /// never moves anything else on the card.
+    @ViewBuilder private var meter: some View {
+        Group {
+            switch model.style {
+            case .waveform: scrollingWaveform
+            case .pulse: pulseBars
+            case .spectrum: spectrumBars
+            case .lively: bouncingBars
+            case .siri: siriWave
             }
         }
-        .frame(height: 22)
-        .animation(.linear(duration: 0.05), value: model.levels)
+        .frame(width: Self.meterWidth, height: Self.meterHeight)
+    }
+
+    private static let meterWidth: CGFloat = 165
+    private static let meterHeight: CGFloat = 22
+    private static let barWidth: CGFloat = 3
+    private static let barSpacing: CGFloat = 3
+
+    /// Bars are 25 ms of audio each, newest on the right.
+    ///
+    /// Deliberately not animated. `ForEach` here is keyed by position, so a
+    /// scrolling meter is not 28 bars moving, it is 28 bars each taking the
+    /// height of its neighbour — and animating that interpolates every bar
+    /// towards the value beside it, which smears the waveform into a blur and
+    /// pays for 28 interpolations every 25 ms to do it. The bars arrive 40
+    /// times a second; that is already smooth, and a redraw is far cheaper
+    /// than a transition.
+    private var scrollingWaveform: some View {
+        HStack(alignment: .center, spacing: Self.barSpacing) {
+            ForEach(Array(model.levels.enumerated()), id: \.offset) { _, level in
+                bar(height: Self.barHeight(for: level))
+            }
+        }
+    }
+
+    /// One loudness value shaping every bar, tallest in the middle.
+    ///
+    /// The envelope is what stops this reading as a solid block: without it all
+    /// the bars are the same height and the meter is a rectangle that changes
+    /// size.
+    private var pulseBars: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30)) { timeline in
+            let breath = Self.breath(at: timeline.date)
+            HStack(alignment: .center, spacing: Self.barSpacing) {
+                ForEach(0..<Self.pulseBarCount, id: \.self) { index in
+                    let envelope = Self.centreWeight(index, of: Self.pulseBarCount)
+                    // A slow breath so the shape is alive at rest too. It is
+                    // scaled by the level, so silence is still flat — the
+                    // motion never invents loudness that was not measured.
+                    let value = Double(model.level) * envelope * breath
+                    bar(height: Self.barHeight(for: Float(value)))
+                }
+            }
+        }
+    }
+
+    /// Real frequency bands, low on the left.
+    private var spectrumBars: some View {
+        HStack(alignment: .center, spacing: Self.barSpacing) {
+            ForEach(Array(model.bands.enumerated()), id: \.offset) { _, magnitude in
+                bar(height: Self.barHeight(for: magnitude), width: Self.wideBarWidth)
+            }
+        }
+    }
+
+    /// Loudness again, with each bar drifting on its own phase.
+    ///
+    /// The drift is decoration, and it is the only decoration here: the height
+    /// is still the measured level, so the meter cannot show movement when
+    /// nobody is speaking — it can only show that movement differently.
+    private var bouncingBars: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30)) { timeline in
+            let time = timeline.date.timeIntervalSinceReferenceDate
+            HStack(alignment: .center, spacing: Self.barSpacing) {
+                ForEach(0..<Self.pulseBarCount, id: \.self) { index in
+                    let phase = Double(index) * 0.7
+                    let speed = 6.0 + Double(index % 4) * 1.7
+                    // 0.55...1.0, so a bar is never fully still while there is
+                    // sound, and never taller than the level allows.
+                    let drift = 0.775 + 0.225 * sin(time * speed + phase)
+                    let envelope = 0.55 + 0.45 * Self.centreWeight(index, of: Self.pulseBarCount)
+                    let value = Double(model.level) * drift * envelope
+                    bar(height: Self.barHeight(for: Float(value)))
+                }
+            }
+        }
+    }
+
+    private var siriWave: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60)) { timeline in
+            SiriWave(
+                amplitude: Double(model.level),
+                time: timeline.date.timeIntervalSinceReferenceDate,
+                height: Self.meterHeight
+            )
+        }
+    }
+
+    private func bar(height: CGFloat, width: CGFloat = OverlayView.barWidth) -> some View {
+        Capsule(style: .continuous)
+            // Quiet bars sit well back, so a spoken syllable stands out against
+            // the room instead of being a slightly brighter shade of the same
+            // red.
+            .fill(Color.red.opacity(0.18 + Double(height / Self.meterHeight) * 0.82))
+            .frame(width: width, height: height)
+    }
+
+    /// Bars for the styles that draw a shape rather than a history. Fewer and
+    /// wider than the waveform's, because they are read as one figure.
+    private static let pulseBarCount = 16
+    private static let wideBarWidth: CGFloat = 5
+
+    /// A visible floor, so silence still reads as "running".
+    private static func barHeight(for level: Float) -> CGFloat {
+        3 + CGFloat(max(0, min(1, level))) * (meterHeight - 3)
+    }
+
+    /// 1 at the centre, tapering to about 0.25 at the ends.
+    private static func centreWeight(_ index: Int, of count: Int) -> Double {
+        guard count > 1 else { return 1 }
+        let position = Double(index) / Double(count - 1) * 2 - 1
+        return 1 - 0.75 * position * position
+    }
+
+    /// A slow rise and fall, so a held note is not a frozen shape.
+    private static func breath(at date: Date) -> Double {
+        0.86 + 0.14 * sin(date.timeIntervalSinceReferenceDate * 3.1)
     }
 
     private var indicatorColor: Color {

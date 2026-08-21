@@ -220,7 +220,7 @@ await runner.test("the previous clipboard is restored afterwards") {
     pasteboard.setString("user's original clipboard", forType: .string)
 
     let inserter = ClipboardPasteInserter(
-        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { true })
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { _ in .acceptsText })
     try inserter.insert("Okay, it actually displays correctly.")
     runner.expectEqual(
         pasteboard.string(forType: .string),
@@ -237,7 +237,7 @@ await runner.test("restore is skipped when the clipboard changed meanwhile") {
     pasteboard.setString("old clipboard", forType: .string)
 
     let inserter = ClipboardPasteInserter(
-        pasteboard: pasteboard, restoreDelay: 0.2, paste: {}, canReceiveText: { true })
+        pasteboard: pasteboard, restoreDelay: 0.2, paste: {}, canReceiveText: { _ in .acceptsText })
     try inserter.insert("transcript text")
 
     // The user copies something during the restore window.
@@ -257,7 +257,7 @@ await runner.test("all clipboard types are preserved, not just plain text") {
     pasteboard.writeObjects([item])
 
     let inserter = ClipboardPasteInserter(
-        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { true })
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { _ in .acceptsText })
     try inserter.insert("dictated sentence")
 
     try await Task.sleep(for: .milliseconds(400))
@@ -274,7 +274,7 @@ await runner.test("with nothing focused the transcript stays on the clipboard") 
     pasteboard.setString("user's original clipboard", forType: .string)
 
     let inserter = ClipboardPasteInserter(
-        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { false })
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { _ in .rejectsText })
     let outcome = try inserter.insert("the sentence that had nowhere to go")
     runner.expectEqual(outcome, .leftOnClipboard)
 
@@ -284,13 +284,29 @@ await runner.test("with nothing focused the transcript stays on the clipboard") 
         pasteboard.string(forType: .string), "the sentence that had nowhere to go")
 }
 
+// The system-wide AXFocusedUIElement query fails outright on macOS 26, and
+// reading that failure as "nothing focused" made the card claim the text had
+// only been copied while the paste was landing normally.
+await runner.test("unreadable focus pastes, keeps a copy, and claims nothing") {
+    let pasteboard = NSPasteboard(name: .init("murmur.test.unknownfocus"))
+    pasteboard.clearContents()
+    pasteboard.setString("user's original clipboard", forType: .string)
+
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { _ in .unknown })
+    runner.expectEqual(try inserter.insert("the sentence that did land"), .pastedUnverified)
+
+    try await Task.sleep(for: .milliseconds(400))
+    runner.expectEqual(pasteboard.string(forType: .string), "the sentence that did land")
+}
+
 await runner.test("a focused field reports pasted and restores the clipboard") {
     let pasteboard = NSPasteboard(name: .init("murmur.test.outcome"))
     pasteboard.clearContents()
     pasteboard.setString("original", forType: .string)
 
     let inserter = ClipboardPasteInserter(
-        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { true })
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {}, canReceiveText: { _ in .acceptsText })
     runner.expectEqual(try inserter.insert("landed"), .pasted)
 
     try await Task.sleep(for: .milliseconds(400))
@@ -692,13 +708,192 @@ await runner.test("word lists saved before aliases existed still decode") {
     runner.expectEqual(decoded.first?.alwaysReplace, false)
 }
 
+// MARK: - Input level meter
+
+runner.suite("Input level meter")
+
+// The meter is the only feedback a batch engine gives while you hold the key,
+// and it used to map -50 dB to 0 dB — full scale, which dictation never
+// reaches. A normal voice sits around -30 dBFS, so speech and an empty room
+// both landed in the middle of the range and looked alike.
+await runner.test("speech and silence land at opposite ends of the meter") {
+    func rms(dBFS: Float) -> Float { pow(10, dBFS / 20) }
+
+    let silence = AudioCapture.loudness(ofRMS: rms(dBFS: -60))
+    let room = AudioCapture.loudness(ofRMS: rms(dBFS: -50))
+    let speech = AudioCapture.loudness(ofRMS: rms(dBFS: -25))
+    let loud = AudioCapture.loudness(ofRMS: rms(dBFS: -18))
+
+    // A quiet room must be flat, not merely low: the meter twitching at an
+    // empty room is what "too sensitive" looks like, and it reads as the app
+    // hearing something that is not there.
+    runner.expectEqual(silence, 0, "silence should sit on the floor")
+    runner.expectEqual(room, 0, "a quiet room moved the meter to \(room)")
+    runner.expectEqual(speech > 0.5, true, "ordinary speech only reached \(speech)")
+    runner.expectEqual(loud > 0.85, true, "raised voice only reached \(loud)")
+}
+
+await runner.test("the curve never falls as the input gets louder") {
+    var previous: Float = -1
+    for dBFS in stride(from: Float(-70), through: 0, by: 2) {
+        let level = AudioCapture.loudness(ofRMS: pow(10, dBFS / 20))
+        runner.expectEqual(level >= previous, true, "level fell at \(dBFS) dBFS")
+        runner.expectEqual(level >= 0 && level <= 1, true, "level out of range at \(dBFS) dBFS")
+        previous = level
+    }
+}
+
+// MARK: - Spectrum meter
+
+runner.suite("Spectrum analyser")
+
+// The bars are only worth drawing if they mean something. A tone must light
+// the band that contains it and leave the others alone — the failure this
+// catches is a bin/band mapping that is off, which looks plausible on screen
+// because a wrong band still moves with your voice.
+await runner.test("a tone lands in the band that contains it") {
+    let sampleRate = 16000.0
+    let analyser = SpectrumAnalyser()
+
+    func bands(ofToneAt hertz: Double) -> [Float] {
+        let count = 512
+        var samples = [Float](repeating: 0, count: count)
+        for index in 0..<count {
+            samples[index] = 0.5 * Float(sin(2 * Double.pi * hertz * Double(index) / sampleRate))
+        }
+        // Twice, because the analyser attacks instantly but is smoothed: one
+        // pass is enough for the peak and this proves it holds.
+        _ = samples.withUnsafeBufferPointer {
+            analyser.bands(of: $0.baseAddress!, count: count, sampleRate: sampleRate)
+        }
+        return samples.withUnsafeBufferPointer {
+            analyser.bands(of: $0.baseAddress!, count: count, sampleRate: sampleRate)
+        }
+    }
+
+    // A band's own edges say where it should land, so the test cannot drift
+    // apart from the implementation it is checking.
+    for band in [2, 6, 10] {
+        let (low, high) = SpectrumAnalyser.edges(of: band)
+        let centre = (low * high).squareRoot()
+        let measured = bands(ofToneAt: centre)
+        let loudest = measured.firstIndex(of: measured.max() ?? 0) ?? -1
+        runner.expectEqual(
+            loudest, band,
+            "a \(Int(centre)) Hz tone lit band \(loudest), not \(band)")
+    }
+}
+
+await runner.test("bands cover speech and rise in frequency") {
+    let first = SpectrumAnalyser.edges(of: 0)
+    let last = SpectrumAnalyser.edges(of: SpectrumAnalyser.bandCount - 1)
+    runner.expectEqual(first.low, 80)
+    runner.expectEqual(Int(last.high.rounded()), 8000)
+
+    var previous = 0.0
+    for band in 0..<SpectrumAnalyser.bandCount {
+        let (low, high) = SpectrumAnalyser.edges(of: band)
+        runner.expectEqual(low > previous, true, "band \(band) does not start above the last")
+        runner.expectEqual(high > low, true, "band \(band) has no width")
+        previous = low
+    }
+}
+
+await runner.test("silence produces no bands at all") {
+    let analyser = SpectrumAnalyser()
+    let silence = [Float](repeating: 0, count: 512)
+    let bands = silence.withUnsafeBufferPointer {
+        analyser.bands(of: $0.baseAddress!, count: 512, sampleRate: 16000)
+    }
+    runner.expectEqual(bands.count, SpectrumAnalyser.bandCount)
+    runner.expectEqual(bands.allSatisfy { $0 == 0 }, true, "silence moved the meter: \(bands)")
+}
+
+// MARK: - Whisper invents words on silence
+
+runner.suite("Whisper silence guard")
+
+// Measured with `--testsilence` on Large v3 Turbo: digital silence returns
+// "you", and room tone returns ".", while Apple's recognizer returns nothing
+// for the same four cases. WhisperKit cannot stop it — its `noSpeechProb` is
+// hardcoded to 0 with a TODO, so `noSpeechThreshold` compares 0 against 0.6
+// forever — so the guard has to live here.
+await runner.test("punctuation-only output carries no words") {
+    runner.expectEqual(WhisperEngine.carriesWords("."), false)
+    runner.expectEqual(WhisperEngine.carriesWords("..."), false)
+    runner.expectEqual(WhisperEngine.carriesWords(" , "), false)
+    runner.expectEqual(WhisperEngine.carriesWords("Hi."), true)
+    runner.expectEqual(WhisperEngine.carriesWords("2016"), true)
+}
+
+await runner.test("stock fillers are dropped only when the audio was too quiet") {
+    // Quieter than any voice: invented.
+    runner.expectEqual(WhisperEngine.isInventedSilence("Thank you.", peak: -55), true)
+    runner.expectEqual(WhisperEngine.isInventedSilence("you", peak: -50), true)
+    runner.expectEqual(WhisperEngine.isInventedSilence("Thanks for watching!", peak: -44), true)
+
+    // Loud enough to have been spoken: kept, or thanking someone out loud
+    // would be deleted.
+    runner.expectEqual(WhisperEngine.isInventedSilence("Thank you.", peak: -25), false)
+    runner.expectEqual(WhisperEngine.isInventedSilence("Thank you.", peak: -30), false)
+
+    // Only whole transcripts. These words inside a sentence are somebody
+    // actually speaking, at any level.
+    runner.expectEqual(
+        WhisperEngine.isInventedSilence("Thank you for the review.", peak: -55), false)
+    runner.expectEqual(WhisperEngine.isInventedSilence("Can you check this?", peak: -55), false)
+}
+
+await runner.test("peak loudness follows the loudest moment, not the average") {
+    let sampleRate = 16000.0
+    // A second of silence with 100 ms of speech in it is an utterance, and
+    // averaging would bury it.
+    var samples = [Float](repeating: 0, count: Int(sampleRate))
+    for index in 0..<Int(sampleRate * 0.1) {
+        samples[index] = index.isMultiple(of: 2) ? 0.1 : -0.1
+    }
+    let peak = WhisperEngine.peakDecibels(samples, sampleRate: sampleRate)
+    runner.expectEqual(peak > -25, true, "a spoken burst measured only \(peak) dBFS")
+
+    let quiet = WhisperEngine.peakDecibels(
+        [Float](repeating: 0, count: Int(sampleRate)), sampleRate: sampleRate)
+    runner.expectEqual(quiet < -100, true, "digital silence measured \(quiet) dBFS")
+}
+
 // MARK: - Model catalog
 
 runner.suite("Model catalog")
 
 await runner.test("both layers offer the expected number of models") {
-    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 8)
+    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 13)
     runner.expectEqual(ModelCatalog.models(in: .correction).count, 5)
+}
+
+// Whisper's variant folders are not a pattern — large-v3-turbo is published
+// under a release date — so a guessed folder resolves to a different
+// checkpoint rather than failing, and the catalog would offer a model nobody
+// chose.
+await runner.test("every Whisper variant is in the catalog exactly once") {
+    let catalogued = ModelCatalog.models(in: .speechRecognition).map(\.id)
+    for variant in WhisperEngine.Variant.allCases {
+        runner.expectEqual(
+            catalogued.filter { $0 == variant.modelID }.count, 1,
+            "\(variant.modelID) is not listed exactly once")
+        runner.expectEqual(
+            WhisperEngine.Variant.from(modelID: variant.modelID), variant,
+            "\(variant.modelID) does not resolve back to its variant")
+    }
+}
+
+await runner.test("Whisper caches inside Murmur's own folder, not Documents") {
+    // WhisperKit's default download base is ~/Documents/huggingface, which is
+    // both a folder nobody asked for and one this app could never find again
+    // to delete.
+    let base = WhisperEngine.downloadBase.path
+    runner.expectEqual(base.contains("/Library/Application Support/Murmur/"), true, base)
+    runner.expectEqual(
+        WhisperEngine.modelsDirectory(.largeV3Turbo).lastPathComponent,
+        "openai_whisper-large-v3-v20240930")
 }
 
 await runner.test("each speech model's streaming claim matches its engine") {

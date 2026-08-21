@@ -74,14 +74,24 @@ ask for it, and the first download is the only step needing a network.
 | Speech | NVIDIA Nemotron Streaming 0.6B (English) | ~1.2 GB | Core ML | yes |
 | Speech | Moonshine Small Streaming | ~400 MB | Moonshine C++ | yes |
 | Speech | Moonshine Medium Streaming | ~1.1 GB | Moonshine C++ | yes |
+| Speech | NVIDIA Parakeet TDT 0.6B v2 | ~452 MB | Core ML | yes |
+| Speech | OpenAI Whisper Tiny / Base (English) | ~153 MB / ~146 MB | Core ML | yes |
+| Speech | OpenAI Whisper Small / Medium (English) | ~487 MB / ~1.5 GB | Core ML | yes |
+| Speech | OpenAI Whisper Large v3 Turbo | ~1.6 GB | Core ML | yes |
 | Cleanup | Apple Foundation Model | built in | macOS | — |
 | Cleanup | Qwen3 4B / 1.7B | ~2.3 GB / ~1.0 GB | MLX | — |
 | Cleanup | Gemma 3 4B / 1B | ~2.5 GB / ~700 MB | MLX | — |
 
-Only speech models that stream live text are eligible; a test enforces this.
+Each speech model declares whether it produces text live while you speak, and a
+test enforces that the claim matches the engine behind it — a model wrongly
+marked live would show an empty overlay for the whole hold. Parakeet TDT and
+every Whisper decode on release instead, so nothing appears until you let go.
+
 Parakeet EOU emits lowercase text with no punctuation, so it needs AI cleanup
 switched on to be readable. Moonshine's English models are MIT licensed; its
-other languages are non-commercial, so Murmur only offers English.
+other languages are non-commercial, so Murmur only offers English. Whisper is
+offered as OpenAI's English-only checkpoints, except Large v3 Turbo, which has
+no English release and is pinned to English instead.
 
 Apple's cleanup model is the best of the cleanup options as well as the
 fastest — the MLX models are there for when Apple Intelligence is unavailable.

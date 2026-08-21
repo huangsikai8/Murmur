@@ -25,6 +25,7 @@ final class Preferences: ObservableObject {
         static let scratchEnabled = "murmur.scratchEnabled"
         static let keepMicrophoneArmed = "murmur.keepMicrophoneArmed"
         static let scratchWindowSeconds = "murmur.scratchWindowSeconds"
+        static let meterStyle = "murmur.meterStyle"
     }
 
     private let defaults = UserDefaults.standard
@@ -115,6 +116,13 @@ final class Preferences: ObservableObject {
         didSet { defaults.set(scratchEnabled, forKey: Key.scratchEnabled) }
     }
 
+    /// How the input meter is drawn. Only visible for engines that produce no
+    /// text until the key is released, since the others show the transcript
+    /// instead and never draw a meter at all.
+    @Published var meterStyle: MeterStyle {
+        didSet { defaults.set(meterStyle.rawValue, forKey: Key.meterStyle) }
+    }
+
     /// How long after an insertion "scratch that" still applies. Deleting is
     /// destructive and cannot verify where the cursor went, so this is the
     /// main thing standing between a retraction and somebody's typing.
@@ -161,6 +169,9 @@ final class Preferences: ObservableObject {
         let turnSilence = defaults.integer(forKey: Key.turnSilenceMilliseconds)
         turnSilenceMilliseconds = turnSilence > 0 ? turnSilence : 250
         scratchEnabled = (defaults.object(forKey: Key.scratchEnabled) as? Bool) ?? true
+        meterStyle =
+            (defaults.string(forKey: Key.meterStyle).flatMap(MeterStyle.init(rawValue:)))
+            ?? .waveform
         keepMicrophoneArmed =
             (defaults.object(forKey: Key.keepMicrophoneArmed) as? Bool) ?? true
         let scratchWindow = defaults.integer(forKey: Key.scratchWindowSeconds)

@@ -310,6 +310,7 @@ final class MenuBarController {
         controller.turnDetectorThreshold = Float(preferences.turnDetectorThreshold)
         controller.turnDetectorSilence = Double(preferences.turnSilenceMilliseconds) / 1000
         controller.scratchEnabled = preferences.scratchEnabled
+        controller.meterStyle = preferences.meterStyle
         controller.keepMicrophoneArmed = preferences.keepMicrophoneArmed
         controller.scratchWindow = .seconds(preferences.scratchWindowSeconds)
         Task {

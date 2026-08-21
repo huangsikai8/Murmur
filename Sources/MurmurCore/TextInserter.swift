@@ -12,16 +12,49 @@ public enum InsertionOutcome: Sendable, Equatable {
     /// deliberately, because the transcript is the more valuable of the two at
     /// that moment, and losing dictated words is the failure worth avoiding.
     case leftOnClipboard
+    /// Pasted, but the focused element could not be read at all, so there is
+    /// no way to know whether anything received it. Treated as the cautious
+    /// middle: the words stay on the clipboard as with `leftOnClipboard`, but
+    /// nothing is announced, because in practice the paste has landed and
+    /// saying it did not is worse than saying nothing.
+    case pastedUnverified
+}
+
+/// Whether the thing with keyboard focus can take typed text.
+public enum FocusVerdict: Sendable, Equatable {
+    /// A focused element was read and looks editable.
+    case acceptsText
+    /// A focused element was read and cannot hold text — or the frontmost
+    /// application reports no focused element at all, which is the case this
+    /// whole check exists for.
+    case rejectsText
+    /// The accessibility tree could not be read. Not the same as "no": on
+    /// macOS 26 the system-wide `AXFocusedUIElement` query returns
+    /// `cannotComplete` immediately, for every application, so treating a
+    /// failed query as a definite "nothing focused" made the app claim it had
+    /// only copied to the clipboard while the paste was landing normally.
+    case unknown
 }
 
 /// Delivers a finished transcript into whatever text field currently has focus.
 public protocol TextInserting: AnyObject, Sendable {
+    /// `targetProcess` is the application dictation started in, which is where
+    /// the paste is going. It is only used to ask the right process whether it
+    /// has a field focused — the paste itself goes wherever the keystroke goes,
+    /// as it always has.
     @discardableResult
-    func insert(_ text: String) throws -> InsertionOutcome
+    func insert(_ text: String, into targetProcess: pid_t?) throws -> InsertionOutcome
 
     /// Removes the last `count` characters, as pressing Delete that many times
     /// would. Used to take back an insertion the speaker rejected.
     func deleteBackward(count: Int) throws
+}
+
+extension TextInserting {
+    @discardableResult
+    public func insert(_ text: String) throws -> InsertionOutcome {
+        try insert(text, into: nil)
+    }
 }
 
 /// Clipboard-and-paste insertion.
@@ -41,7 +74,7 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
     /// the same reason `paste` is: a test process has no focused field, so the
     /// real probe would answer "no" to every case and the restore behaviour
     /// could not be exercised at all.
-    public typealias FocusProbe = @Sendable () -> Bool
+    public typealias FocusProbe = @Sendable (pid_t?) -> FocusVerdict
 
     private let pasteboard: NSPasteboard
     private let paste: PasteAction
@@ -62,14 +95,16 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
     }
 
     @discardableResult
-    public func insert(_ text: String) throws -> InsertionOutcome {
+    public func insert(_ text: String, into targetProcess: pid_t? = nil) throws
+        -> InsertionOutcome
+    {
         guard !text.isEmpty else { return .pasted }
 
         // Asked *before* pasting, because afterwards the answer is confounded
         // by the paste itself. This only decides whether the clipboard is put
         // back — the paste is attempted either way, so a false negative costs
         // the previous clipboard and never costs the transcript.
-        let canReceive = canReceiveText()
+        let verdict = canReceiveText(targetProcess)
 
         let saved = Self.snapshot(pasteboard)
 
@@ -79,11 +114,11 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
 
         paste()
 
-        guard canReceive else {
-            // Nothing to paste into: keep the words on the clipboard so they
-            // can be placed by hand. Restoring here would silently discard a
-            // sentence that was just spoken.
-            return .leftOnClipboard
+        guard verdict == .acceptsText else {
+            // Nothing to paste into, or no way to tell: keep the words on the
+            // clipboard so they can be placed by hand. Restoring here would
+            // silently discard a sentence that was just spoken.
+            return verdict == .unknown ? .pastedUnverified : .leftOnClipboard
         }
 
         // Restore only if nothing else has claimed the pasteboard since, so a
@@ -97,62 +132,162 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
 
     // MARK: - Is there anywhere for the text to go?
 
-    /// Whether the focused element looks able to accept typed text.
-    ///
-    /// Deliberately generous. A wrong "no" merely leaves the transcript on the
-    /// clipboard, while a wrong "yes" is exactly today's behaviour, so the
-    /// bias is towards saying yes: any element whose value can be set counts,
-    /// and the text roles count even when they do not report a settable value,
-    /// which some web and Electron views do not.
-    /// Reports what the focused element is, so a wrong answer can be diagnosed
+    /// Reports each query and its answer, so a wrong verdict can be diagnosed
     /// instead of argued about. Wired to the log by the app.
     public nonisolated(unsafe) static var diagnostics: (@Sendable (String) -> Void)?
 
-    public static let focusedElementAcceptsText: FocusProbe = {
-        describeFocus().acceptsText
+    public static let focusedElementAcceptsText: FocusProbe = { target in
+        describeFocus(target: target).verdict
     }
 
-    /// What currently has keyboard focus, and whether text can be typed into it.
-    public static func describeFocus() -> (description: String, acceptsText: Bool) {
-        let system = AXUIElementCreateSystemWide()
-        var focused: CFTypeRef?
-        guard
-            AXUIElementCopyAttributeValue(
-                system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-            let value = focused,
-            CFGetTypeID(value) == AXUIElementGetTypeID()
-        else {
-            report("focus: nothing focused -> clipboard")
-            return ("nothing focused", false)
+    /// What has keyboard focus in the application the text is going to, and
+    /// whether text can be typed into it.
+    ///
+    /// Asking "what is focused right now" is the obvious approach and it does
+    /// not work. Measured on macOS 26: the system-wide `AXFocusedUIElement`
+    /// returns `cannotComplete` in 0 ms from a command-line process, and
+    /// `noValue` from the running app in the instant after the overlay is
+    /// hidden — while the paste that follows lands in the field perfectly.
+    /// Both were read as "nothing focused", which is what produced the card
+    /// claiming the text had only been copied.
+    ///
+    /// So the question asked is a narrower one with a stable answer: does the
+    /// application this dictation *started* in have an editable element
+    /// focused. That target is captured on the hotkey, before any of this
+    /// churn, and it is where the paste is going.
+    public static func describeFocus(target: pid_t? = nil)
+        -> (description: String, verdict: FocusVerdict)
+    {
+        var attempts: [String] = []
+
+        for query in queries(target: target) {
+            var focused: CFTypeRef?
+            var status = AXUIElementCopyAttributeValue(
+                query.element, kAXFocusedUIElementAttribute as CFString, &focused)
+
+            // Chromium — so VS Code, Slack, Discord, every Electron app —
+            // builds no accessibility tree until an assistive app asks for
+            // one, and answers `noValue` until it has. Asking is a single
+            // attribute write, after which the same query returns the real
+            // focused element.
+            if status != .success, let pid = query.process, enableChromiumAccessibility(pid) {
+                focused = nil
+                status = AXUIElementCopyAttributeValue(
+                    query.element, kAXFocusedUIElementAttribute as CFString, &focused)
+                attempts.append("\(query.name)=asked for an accessibility tree")
+            }
+
+            guard status == .success, let value = focused,
+                CFGetTypeID(value) == AXUIElementGetTypeID()
+            else {
+                attempts.append("\(query.name)=\(describe(status))")
+                continue
+            }
+
+            let element = value as! AXUIElement
+            var role: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+            let name = (role as? String) ?? "unknown"
+
+            var settable: DarwinBoolean = false
+            let settableKnown =
+                AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
+                == .success
+
+            // A settable value is the strong signal, and the role is the
+            // fallback for the fields that do not report one. The roles are
+            // kept narrow on purpose: `AXGroup` covers most of the
+            // accessibility tree, so counting it meant the answer was "yes, it
+            // can take text" almost everywhere, including on the desktop —
+            // which is exactly the case this exists to catch.
+            let accepts = (settableKnown && settable.boolValue) || textRoles.contains(name)
+            let settableText = settableKnown ? String(settable.boolValue) : "?"
+            report(
+                "focus: \(attempts.joined(separator: ", "))\(attempts.isEmpty ? "" : ", ")"
+                    + "\(query.name)=role \(name) settable=\(settableText) "
+                    + "-> \(accepts ? "paste" : "clipboard")")
+            return (
+                "\(name), settable=\(settableText), via \(query.name)",
+                accepts ? .acceptsText : .rejectsText
+            )
         }
 
-        let element = value as! AXUIElement
+        // Nothing could be read anywhere. Deliberately *not* reported as
+        // "nothing focused": every observed failure here — `cannotComplete`
+        // from a system-wide query that never works, `noValue` in the moment
+        // after the overlay closes — sat in front of a paste that landed. A
+        // wrong "no" here is a false alarm on every single utterance, which is
+        // worse than the silence, and the transcript is kept on the clipboard
+        // either way so nothing is lost.
+        report("focus: \(attempts.joined(separator: ", ")) -> unreadable, pasting anyway")
+        return ("unreadable (\(attempts.joined(separator: ", ")))", .unknown)
+    }
 
-        var role: CFTypeRef?
-        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
-        let name = (role as? String) ?? "unknown"
+    /// The elements worth asking, most authoritative first, each named for the
+    /// log so a failing step is identifiable rather than inferred.
+    private static func queries(target: pid_t?)
+        -> [(name: String, element: AXUIElement, process: pid_t?)]
+    {
+        var queries: [(String, AXUIElement, pid_t?)] = []
+        let frontmost = NSWorkspace.shared.frontmostApplication
 
-        var settable: DarwinBoolean = false
-        let settableKnown =
-            AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
-            == .success
+        if let target {
+            let name =
+                NSRunningApplication(processIdentifier: target)?.localizedName ?? "pid \(target)"
+            queries.append(("target \(name)", AXUIElementCreateApplication(target), target))
+        }
+        if let frontmost, frontmost.processIdentifier != target {
+            let pid = frontmost.processIdentifier
+            queries.append((
+                "frontmost \(frontmost.localizedName ?? "pid \(pid)")",
+                AXUIElementCreateApplication(pid), pid
+            ))
+        }
+        queries.append(("system-wide", AXUIElementCreateSystemWide(), nil))
+        return queries
+    }
 
-        // A settable value is the strong signal, and the role is the fallback
-        // for the fields that do not report one. The roles are kept narrow on
-        // purpose: `AXGroup` covers most of the accessibility tree, so counting
-        // it meant the answer was "yes, it can take text" almost everywhere,
-        // including on the desktop — which is exactly the case this exists to
-        // catch.
-        let accepts = (settableKnown && settable.boolValue) || textRoles.contains(name)
-        report(
-            "focus: role=\(name) settable=\(settableKnown ? String(settable.boolValue) : "?") "
-                + "-> \(accepts ? "paste" : "clipboard")")
-        return ("\(name), settable=\(settableKnown ? String(settable.boolValue) : "unknown")",
-            accepts)
+    /// Applications already asked to build an accessibility tree, so the write
+    /// happens once each rather than on every utterance.
+    private nonisolated(unsafe) static var accessibilityRequested: Set<pid_t> = []
+    private static let requestedLock = NSLock()
+
+    /// Asks a Chromium-based application to expose its accessibility tree.
+    ///
+    /// `AXManualAccessibility` is Chromium's own opt-in switch, ignored by
+    /// every application that is not built on it — so this is a no-op
+    /// everywhere else rather than something that needs to detect Electron.
+    /// Returns whether it is worth querying again.
+    private static func enableChromiumAccessibility(_ pid: pid_t) -> Bool {
+        requestedLock.lock()
+        let alreadyAsked = accessibilityRequested.contains(pid)
+        if !alreadyAsked { accessibilityRequested.insert(pid) }
+        requestedLock.unlock()
+        guard !alreadyAsked else { return false }
+
+        let application = AXUIElementCreateApplication(pid)
+        let status = AXUIElementSetAttributeValue(
+            application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        return status == .success
     }
 
     private static func report(_ message: String) {
         diagnostics?(message)
+    }
+
+    private static func describe(_ status: AXError) -> String {
+        switch status {
+        case .success: "success"
+        case .failure: "failure"
+        case .illegalArgument: "illegalArgument"
+        case .invalidUIElement: "invalidUIElement"
+        case .cannotComplete: "cannotComplete"
+        case .attributeUnsupported: "attributeUnsupported"
+        case .noValue: "noValue"
+        case .apiDisabled: "apiDisabled"
+        case .notImplemented: "notImplemented"
+        default: "error \(status.rawValue)"
+        }
     }
 
     /// Roles that hold editable text. Deliberately narrow — see `describeFocus`.
@@ -244,7 +379,9 @@ public final class RecordingInserter: TextInserting, @unchecked Sendable {
     }
 
     @discardableResult
-    public func insert(_ text: String) throws -> InsertionOutcome {
+    public func insert(_ text: String, into targetProcess: pid_t? = nil) throws
+        -> InsertionOutcome
+    {
         lock.lock(); defer { lock.unlock() }
         storage.append(text)
         return .pasted

@@ -235,6 +235,89 @@ public enum ModelCatalog {
                 + "in exchange for that wait."
         ),
 
+        // MARK: Whisper
+        //
+        // Sizes are per variant folder, not the repository total: the repo
+        // carries every Whisper size and several quantizations, and WhisperKit
+        // fetches one folder. Base and Large v3 Turbo are measured on disk
+        // after a real download — 146 MB and 1569 MB, against 147 and 1620
+        // summed from the repository listing, so the listing runs a few per
+        // cent high and the rest are marked with what it reports. Each figure
+        // includes the ~3 MB tokenizer, which is a second download from
+        // `openai/whisper-*`. Tiny is larger than Base because its folder
+        // carries extra compiled variants.
+        AIModelDescriptor(
+            id: WhisperEngine.Variant.tiny.modelID,
+            layer: .speechRecognition,
+            name: "OpenAI Whisper Tiny (English)",
+            vendor: "OpenAI via WhisperKit",
+            sizeMB: 153,
+            license: "MIT",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "The smallest Whisper. Fast and cheap to keep resident, and the least "
+                + "accurate of the family — it mishears unusual words the larger ones get."
+        ),
+        AIModelDescriptor(
+            id: WhisperEngine.Variant.base.modelID,
+            layer: .speechRecognition,
+            name: "OpenAI Whisper Base (English)",
+            vendor: "OpenAI via WhisperKit",
+            sizeMB: 146,
+            license: "MIT",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "A step up from Tiny at the same download size. The lightest Whisper "
+                + "worth using for dictation."
+        ),
+        AIModelDescriptor(
+            id: WhisperEngine.Variant.small.modelID,
+            layer: .speechRecognition,
+            name: "OpenAI Whisper Small (English)",
+            vendor: "OpenAI via WhisperKit",
+            sizeMB: 487,
+            license: "MIT",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "The usual balance of the family: most of the accuracy of the large "
+                + "models for a third of the memory."
+        ),
+        AIModelDescriptor(
+            id: WhisperEngine.Variant.medium.modelID,
+            layer: .speechRecognition,
+            name: "OpenAI Whisper Medium (English)",
+            vendor: "OpenAI via WhisperKit",
+            sizeMB: 1530,
+            license: "MIT",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "English-only Medium. Nearly the size of Large v3 Turbo and older, so "
+                + "it is here for completeness rather than as a recommendation."
+        ),
+        AIModelDescriptor(
+            id: WhisperEngine.Variant.largeV3Turbo.modelID,
+            layer: .speechRecognition,
+            name: "OpenAI Whisper Large v3 Turbo",
+            vendor: "OpenAI via WhisperKit",
+            sizeMB: 1569,
+            license: "MIT",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "The most accurate Whisper here, with a decoder cut to four layers so "
+                + "it decodes several times faster than Large v3. Multilingual weights, "
+                + "pinned to English."
+        ),
+
         // MARK: Text cleanup
         AIModelDescriptor(
             id: appleCorrectionID,
@@ -313,6 +396,9 @@ public enum ModelCatalog {
             ids.insert(variant.modelID)
         }
         if ParakeetBatchEngine.isInstalled { ids.insert(ParakeetBatchEngine.modelID) }
+        for variant in WhisperEngine.Variant.allCases where WhisperEngine.isInstalled(variant) {
+            ids.insert(variant.modelID)
+        }
         return ids
     }
 
@@ -337,6 +423,10 @@ public enum ModelCatalog {
             try await ParakeetBatchEngine().install()
             return
         }
+        if let variant = WhisperEngine.Variant.from(modelID: descriptor.id) {
+            try await WhisperEngine(variant: variant).install(progress: progress)
+            return
+        }
         throw SpeechEngineError.unavailable("\(descriptor.name) cannot be downloaded yet.")
     }
 
@@ -356,6 +446,10 @@ public enum ModelCatalog {
         }
         if descriptor.id == ParakeetBatchEngine.modelID {
             try ParakeetBatchEngine.delete()
+            return
+        }
+        if let variant = WhisperEngine.Variant.from(modelID: descriptor.id) {
+            try WhisperEngine.delete(variant)
         }
     }
 
