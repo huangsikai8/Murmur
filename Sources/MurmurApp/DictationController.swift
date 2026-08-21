@@ -896,6 +896,7 @@ final class DictationController {
                     text: inserted, bundleIdentifier: target?.bundleIdentifier,
                     at: ContinuousClock.now)
             }
+            HistoryStore.shared.record(transcript)
         } catch {
             Log.write("hands-free insertion failed: \(error.localizedDescription)")
         }
@@ -1159,6 +1160,7 @@ final class DictationController {
             if outcome == .pastedUnverified {
                 Log.write("focus unreadable; pasted anyway and kept a clipboard copy")
             }
+            HistoryStore.shared.record(transcript)
         } catch {
             NSLog("[murmur] insertion failed: \(error.localizedDescription)")
         }

@@ -52,6 +52,8 @@ private struct SettingsView: View {
                 .tabItem { Label("Words", systemImage: "character.book.closed") }
             ModelSettings(onChange: onChange)
                 .tabItem { Label("Models", systemImage: "shippingbox") }
+            HistorySettings()
+                .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
         }
         .frame(width: 620, height: 520)
     }
@@ -810,6 +812,90 @@ private struct ModelSettings: View {
             ProgressView(value: fraction).frame(width: 90)
         case .unavailable:
             Text("Unavailable").font(.callout).foregroundStyle(.tertiary)
+        }
+    }
+}
+
+// MARK: - History
+
+@MainActor
+private final class HistoryModel: ObservableObject {
+    @Published var entries: [HistoryEntry] = []
+
+    private let store = HistoryStore.shared
+
+    func load() { entries = store.entries }
+}
+
+private struct HistorySettings: View {
+    @StateObject private var model = HistoryModel()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Recent transcriptions").font(.headline)
+                Text("The last \(HistoryStore.limit) sentences Murmur inserted.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            if model.entries.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("Nothing dictated yet.").foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(model.entries) { entry in
+                        HistoryRow(entry: entry)
+                    }
+                }
+            }
+        }
+        .padding()
+        .onAppear { model.load() }
+    }
+}
+
+private struct HistoryRow: View {
+    let entry: HistoryEntry
+
+    @State private var copied = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.text)
+                    .lineLimit(3)
+                Text(entry.date.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button(action: copy) {
+                Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(copied ? Color.accentColor : .secondary)
+            .help(copied ? "Copied" : "Copy")
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func copy() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(entry.text, forType: .string)
+        withAnimation(.easeOut(duration: 0.15)) { copied = true }
+        Task {
+            try? await Task.sleep(for: .seconds(1.2))
+            withAnimation(.easeOut(duration: 0.15)) { copied = false }
         }
     }
 }
