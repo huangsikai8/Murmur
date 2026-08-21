@@ -79,6 +79,13 @@ public struct SpokenFormatter {
         "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
     ]
 
+    /// Words that close a group and multiply it. "hundred" is not here: it
+    /// multiplies what is being read without closing it, so "one hundred
+    /// twenty three" keeps accumulating afterwards.
+    private static let scales: [String: Int] = [
+        "thousand": 1000, "million": 1_000_000,
+    ]
+
     // MARK: - Entry point
 
     public static func format(_ text: String, options: Options) -> String {
@@ -258,6 +265,14 @@ public struct SpokenFormatter {
     }
 
     private static func matchNumber(_ tokens: [String], at index: Int) -> (String, Int)? {
+        guard let (rendered, after) = readFigure(tokens, at: index) else { return nil }
+        // The recognizer attaches punctuation to the word it followed, so the
+        // last word of a figure can be carrying a comma or a full stop.
+        // Replacing the word with digits must not take that with it.
+        return (rendered + trailingPunctuation(tokens[after - 1]), after)
+    }
+
+    private static func readFigure(_ tokens: [String], at index: Int) -> (String, Int)? {
         if let (year, after) = readYear(tokens, from: index) { return (String(year), after) }
         guard let (value, after) = readNumber(tokens, from: index) else { return nil }
         // "three point five" is unmistakably a figure however small its whole
@@ -274,9 +289,26 @@ public struct SpokenFormatter {
         // and "1 of the things" reads as a typo. Every other number word,
         // "nineteen" included, is a count when it stands alone. The exception
         // is deliberately narrow: "twenty one" and "one hundred" are compounds
-        // and still convert, because there "one" really is arithmetic.
-        if after - index == 1, normalized(tokens[index]) == "one" { return nil }
+        // and still convert, because there "one" really is arithmetic — and so
+        // is a run of digits read aloud, where "one 2 3" would be absurd.
+        if after - index == 1, normalized(tokens[index]) == "one",
+            !isReadingOutDigits(tokens, at: index)
+        {
+            return nil
+        }
         return (String(value), after)
+    }
+
+    /// True when a bare "one" sits in a run of spoken digits rather than in
+    /// prose, which a number word on either side of it settles. Punctuation
+    /// ends a run, so "I have two, one is broken" stays prose.
+    private static func isReadingOutDigits(_ tokens: [String], at index: Int) -> Bool {
+        func isNumberNeighbour(_ position: Int) -> Bool {
+            guard position >= 0, position < tokens.count else { return false }
+            return isBareWord(tokens[position]) && isNumberWord(normalized(tokens[position]))
+        }
+        guard isBareWord(tokens[index]) else { return false }
+        return isNumberNeighbour(index - 1) || isNumberNeighbour(index + 1)
     }
 
     private static func isMonthWord(_ token: String) -> Bool {
@@ -334,6 +366,10 @@ public struct SpokenFormatter {
     /// "twenty twenty six" and "nineteen eighty four" become 2026 and 1984.
     private static func readYear(_ tokens: [String], from index: Int) -> (Int, Int)? {
         guard index + 1 < tokens.count else { return nil }
+        // Punctuation ends a compound here for the same reason it does in
+        // `readNumber`: "twenty, twenty six" is two figures with a comma
+        // between them, and reading it as 2026 loses the comma as well.
+        guard trailingPunctuation(tokens[index]).isEmpty else { return nil }
         let first = normalized(tokens[index])
         // 1900s come from the teens ("nineteen"), 2000s from a tens word
         // ("twenty"), so both tables have to be consulted.
@@ -354,7 +390,9 @@ public struct SpokenFormatter {
 
         var total = century * 100 + tensValue
         var cursor = index + 2
-        if cursor < tokens.count, let unit = units[normalized(tokens[cursor])], unit < 10 {
+        if trailingPunctuation(tokens[index + 1]).isEmpty, cursor < tokens.count,
+            let unit = units[normalized(tokens[cursor])], unit < 10
+        {
             total += unit
             cursor += 1
         }
@@ -362,31 +400,74 @@ public struct SpokenFormatter {
     }
 
     /// Reads a spelled cardinal, returning its value and the index after it.
+    ///
+    /// English compounds numbers in a few specific shapes and in no others: a
+    /// tens word may take a unit ("twenty one"), anything below a hundred may
+    /// multiply a scale word ("three hundred"), and scale words descend ("two
+    /// million four thousand"). A run of bare units is not one of those shapes.
+    /// It is someone reading digits aloud, and folding "one two three" into 6
+    /// is exactly the corruption the rest of this file exists to prevent.
     private static func readNumber(_ tokens: [String], from index: Int) -> (Int, Int)? {
         var cursor = index
-        var total = 0
-        var current = 0
+        var total = 0        // groups already closed by a scale word
+        var hundreds = 0     // the "N hundred" part of the group being read
+        var below = 0        // the 1-99 part of the group being read
+        var hasTens = false
+        var hasUnit = false
+        var smallestScale = Int.max
+        // Where the 1-99 run being read began. A scale word that turns out to
+        // be unusable has to give those words back, or they are read into this
+        // number and counted again in the next one: "one thousand two
+        // thousand" came out as "1002 1000".
+        var pendingStart = index
         var consumedAny = false
         var sawScale = false
 
         while cursor < tokens.count {
-            let word = normalized(tokens[cursor])
+            let token = tokens[cursor]
+            let word = normalized(token)
+
             if let unit = units[word] {
-                current += unit
+                if unit >= 10 {
+                    // A teen fills the tens and the units place at once, so
+                    // nothing may join it: "sixteen three" is two numbers.
+                    guard !hasTens, !hasUnit else { break }
+                    hasTens = true
+                } else {
+                    // A unit may open the group or follow a tens word, and
+                    // that is all: "one two" is two numbers.
+                    guard !hasUnit else { break }
+                }
+                if !hasTens || unit >= 10 { pendingStart = cursor }
+                below += unit
+                hasUnit = true
             } else if let ten = tens[word] {
-                current += ten
+                guard !hasTens, !hasUnit else { break }
+                pendingStart = cursor
+                below += ten
+                hasTens = true
             } else if word == "hundred" {
-                current = max(current, 1) * 100
+                guard hundreds == 0 else { cursor = pendingStart; below = 0; break }
+                hundreds = max(below, 1) * 100
+                below = 0
+                hasTens = false
+                hasUnit = false
+                pendingStart = cursor + 1
                 sawScale = true
-            } else if word == "thousand" {
-                total += max(current, 1) * 1000
-                current = 0
-                sawScale = true
-            } else if word == "million" {
-                total += max(current, 1) * 1_000_000
-                current = 0
+            } else if let scale = scales[word] {
+                // Scale words descend. "two thousand five hundred" is one
+                // number; "one thousand two thousand" is two.
+                guard scale < smallestScale else { cursor = pendingStart; below = 0; break }
+                total += max(hundreds + below, 1) * scale
+                hundreds = 0
+                below = 0
+                hasTens = false
+                hasUnit = false
+                pendingStart = cursor + 1
+                smallestScale = scale
                 sawScale = true
             } else if word == "and", sawScale, cursor + 1 < tokens.count,
+                trailingPunctuation(token).isEmpty,
                 isNumberWord(normalized(tokens[cursor + 1]))
             {
                 // "two thousand and sixteen" is one number; "two and three" is
@@ -397,23 +478,32 @@ public struct SpokenFormatter {
             } else {
                 break
             }
+
             consumedAny = true
             cursor += 1
+            // Punctuation ends the figure. Without this "I have two, one is
+            // broken" reads as one number and the comma is swallowed with it.
+            if !trailingPunctuation(token).isEmpty { break }
         }
         guard consumedAny else { return nil }
-        return (total + current, cursor)
+        return (total + hundreds + below, cursor)
     }
 
     // MARK: - Helpers
 
     private static func isNumberWord(_ word: String) -> Bool {
-        units[word] != nil || tens[word] != nil
-            || word == "hundred" || word == "thousand" || word == "million"
+        units[word] != nil || tens[word] != nil || scales[word] != nil || word == "hundred"
     }
 
     /// Lowercased, stripped of surrounding punctuation, for comparison only.
     private static func normalized(_ token: String) -> String {
         token.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters)
+    }
+
+    /// Punctuation the recognizer attached to the end of a token, which has to
+    /// be carried across when the word itself is replaced by digits.
+    private static func trailingPunctuation(_ token: String) -> String {
+        String(token.reversed().prefix(while: \.isPunctuation).reversed())
     }
 
     /// True when the token carries no punctuation of its own, so removing it

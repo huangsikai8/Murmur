@@ -1269,6 +1269,74 @@ await runner.test("lists and markdown convert only when asked") {
         SpokenFormatter.format("bold ship it.", options: options), "**Ship it**.")
 }
 
+await runner.test("a run of number words stays a run of numbers") {
+    var options = SpokenFormatter.Options()
+    options.numbers = true
+
+    // Reported from real dictation: reading out digits summed them. English
+    // compounds numbers in a few shapes and in no others, and a run of bare
+    // units is not one of them — it is someone reading digits aloud.
+    runner.expectEqual(
+        SpokenFormatter.format("one two three", options: options), "1 2 3")
+    runner.expectEqual(
+        SpokenFormatter.format("five five five", options: options), "5 5 5")
+    runner.expectEqual(
+        SpokenFormatter.format("call nine one one", options: options), "Call 9 1 1")
+    // A teen fills the tens and the units place at once, so nothing may follow
+    // it into the same figure.
+    runner.expectEqual(
+        SpokenFormatter.format("sixteen three", options: options), "16 3")
+    // Two tens words are two numbers.
+    runner.expectEqual(
+        SpokenFormatter.format("thirty forty", options: options), "30 40")
+    // Scale words may only descend.
+    runner.expectEqual(
+        SpokenFormatter.format("one thousand two thousand", options: options),
+        "1000 2000")
+    // A rejected scale word must give back the words it had already read, or
+    // they are counted twice.
+    runner.expectEqual(
+        SpokenFormatter.format("one hundred two hundred", options: options),
+        "100 200")
+
+    // The compounds that are real must survive all of the above.
+    runner.expectEqual(
+        SpokenFormatter.format("twenty one people", options: options), "21 people")
+    runner.expectEqual(
+        SpokenFormatter.format("one hundred twenty three", options: options), "123")
+    runner.expectEqual(
+        SpokenFormatter.format("two thousand and sixteen", options: options), "2016")
+    runner.expectEqual(
+        SpokenFormatter.format("two thousand three hundred", options: options), "2300")
+
+    // "One" is a pronoun on its own, but not when it sits in a run of digits:
+    // "one 2 3" would be absurd. A number word either side settles it, and
+    // punctuation between them ends the run.
+    runner.expectEqual(
+        SpokenFormatter.format("one of the things", options: options),
+        "One of the things")
+    runner.expectEqual(
+        SpokenFormatter.format("just one more time", options: options),
+        "Just one more time")
+    runner.expectEqual(
+        SpokenFormatter.format("two one", options: options), "2 1")
+    runner.expectEqual(
+        SpokenFormatter.format("I have two, one is broken", options: options),
+        "I have 2, one is broken")
+    // A year is a compound too, and must not reach across punctuation either.
+    runner.expectEqual(
+        SpokenFormatter.format("twenty, twenty six", options: options), "20, 26")
+    runner.expectEqual(
+        SpokenFormatter.format("in twenty twenty six, we ship", options: options),
+        "In 2026, we ship")
+    runner.expectEqual(
+        SpokenFormatter.format("nineteen eighty, four", options: options), "1980, 4")
+    // Punctuation on the last word of a figure survives the conversion.
+    runner.expectEqual(
+        SpokenFormatter.format("there were twenty one.", options: options),
+        "There were 21.")
+}
+
 await runner.test("formatting never splits a word") {
     var options = SpokenFormatter.Options()
     options.numbers = true
