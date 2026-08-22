@@ -297,6 +297,20 @@ reason: a swap that did not happen is instant.
 v2 repo totals ~2.6 GB because it carries several precisions; FluidAudio fetches
 one set and lands at 452 MB on disk.
 
+**`SMAppService.Status.notFound` does not mean the bundle is broken.** It is
+what a copy that has *never* been registered reports, and it registers from
+there perfectly well. Measured on the build-directory copy: status 3
+(`.notFound`) → `register()` → 1 (`.enabled`), with the record visible in
+`sfltool dumpbtm` pointing at that path; `unregister()` → 0
+(`.notRegistered`), leaving a disabled record behind. So the three "off" states
+are not interchangeable, and only `.requiresApproval` — registered, switched
+off by hand in System Settings, where registering again does nothing — is worth
+telling anyone about. `LoginItem` reads the service rather than storing a bool,
+for the same reason the microphone switch reads the engine: System Settings can
+revoke the registration without telling the app, and a stored bool would tick a
+switch over nothing. It is refreshed in `SettingsWindowController.show()`, not
+`.onAppear`, because that window is built once and kept.
+
 **A changed app icon can look unchanged.** macOS caches icons keyed by bundle
 path, so after a rebuild Privacy & Security and the permission prompt can keep
 showing the old one — or the blank page from before there was an icon at all —

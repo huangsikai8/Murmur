@@ -9,6 +9,7 @@ final class SettingsWindowController {
     private var window: NSWindow?
     private let preferences: Preferences
     private let onChange: () -> Void
+    private let loginItem = LoginItem()
 
     init(preferences: Preferences, onChange: @escaping () -> Void) {
         self.preferences = preferences
@@ -16,13 +17,19 @@ final class SettingsWindowController {
     }
 
     func show() {
+        // Login Items can be switched off in System Settings without telling
+        // the app, and the window below is built once and kept, so `.onAppear`
+        // fires only the first time a tab is shown. Re-read on every open.
+        loginItem.refresh()
+
         if let window {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
 
-        let view = SettingsView(preferences: preferences, onChange: onChange)
+        let view = SettingsView(
+            preferences: preferences, loginItem: loginItem, onChange: onChange)
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
         window.title = "Murmur Settings"
@@ -40,11 +47,12 @@ final class SettingsWindowController {
 
 private struct SettingsView: View {
     @ObservedObject var preferences: Preferences
+    @ObservedObject var loginItem: LoginItem
     let onChange: () -> Void
 
     var body: some View {
         TabView {
-            GeneralSettings(preferences: preferences, onChange: onChange)
+            GeneralSettings(preferences: preferences, loginItem: loginItem, onChange: onChange)
                 .tabItem { Label("General", systemImage: "keyboard") }
             CleanupSettings(preferences: preferences, onChange: onChange)
                 .tabItem { Label("Cleanup", systemImage: "wand.and.stars") }
@@ -63,6 +71,7 @@ private struct SettingsView: View {
 
 private struct GeneralSettings: View {
     @ObservedObject var preferences: Preferences
+    @ObservedObject var loginItem: LoginItem
     let onChange: () -> Void
 
     var body: some View {
@@ -252,6 +261,51 @@ private struct GeneralSettings: View {
                 Text("A brief tap is treated as an ordinary keypress and inserts nothing.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+
+            Section {
+                // Bound to LaunchServices rather than to a stored preference,
+                // so the switch cannot claim a registration that System
+                // Settings has since removed.
+                Toggle(
+                    "Open Murmur at login",
+                    isOn: Binding(
+                        get: { loginItem.isEnabled },
+                        set: { loginItem.setEnabled($0) })
+                )
+
+                if let explanation = loginItem.explanation {
+                    Label(explanation, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                    Button("Open Login Items\u{2026}") { loginItem.openLoginItemsSettings() }
+                }
+
+                if let failure = loginItem.failure {
+                    Label(failure, systemImage: "xmark.octagon")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
+
+                if !loginItem.isInApplicationsFolder {
+                    Text(
+                        "This copy is running from \(Bundle.main.bundleURL.deletingLastPathComponent().path). "
+                            + "Login items name an exact location, so moving or deleting "
+                            + "this copy leaves an item that opens nothing."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Startup")
+            } footer: {
+                Text(
+                    "Murmur has no Dock icon and no window, so it is easy to forget "
+                        + "to start it \u{2014} the menu bar mark is the only sign it is "
+                        + "running."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

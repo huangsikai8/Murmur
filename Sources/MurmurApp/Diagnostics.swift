@@ -23,6 +23,9 @@ enum Diagnostics {
         print("     needed to see the hotkey while another app is frontmost,")
         print("     and to post the paste keystroke into that app.")
 
+        print("\nStartup")
+        for line in await loginItemLines() { print(line) }
+
         print("\nSpeech model")
         let locale = Locale.current
         print("  Locale:             \(locale.identifier)")
@@ -84,6 +87,30 @@ enum Diagnostics {
         case .modelNotReady: "(model still downloading)"
         @unknown default: "(unknown reason)"
         }
+    }
+
+    /// Reported rather than stored: LaunchServices owns this setting, and
+    /// System Settings can switch it off without telling the app.
+    @MainActor
+    private static func loginItemLines() -> [String] {
+        let item = LoginItem()
+        let detail: String
+        switch item.status {
+        case .enabled: detail = "registered and enabled"
+        case .notRegistered: detail = "not registered"
+        case .requiresApproval: detail = "registered, switched off in System Settings"
+        case .notFound: detail = "macOS cannot find this bundle"
+        @unknown default: detail = "unknown"
+        }
+        var lines = [
+            "  Open at login:      \(mark(item.isEnabled)) \(detail)",
+            "  Bundle:             \(Bundle.main.bundleURL.path)",
+        ]
+        if !item.isInApplicationsFolder {
+            lines.append("     a login item names this exact path, so a copy run from a")
+            lines.append("     build directory registers the build directory.")
+        }
+        return lines
     }
 
     private static func mark(_ value: Bool) -> String {
