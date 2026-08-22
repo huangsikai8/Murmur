@@ -13,16 +13,24 @@ public func withDeadline<T: Sendable>(
     _ work: @escaping @Sendable () async -> T
 ) async -> T? {
     let once = OnceBox()
-    return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+    var timer: Task<Void, Never>?
+    let result = await withCheckedContinuation {
+        (continuation: CheckedContinuation<T?, Never>) in
         Task {
             let value = await work()
             if once.claim() { continuation.resume(returning: value) }
         }
-        Task {
+        timer = Task {
             try? await Task.sleep(for: deadline)
             if once.claim() { continuation.resume(returning: nil) }
         }
     }
+    // The wait is over, so this timer can only ever find the box already
+    // claimed. Cancelled rather than left to sleep the deadline out: cleanup
+    // is bounded at 20 s, so every utterance otherwise left a task asleep for
+    // that long, and continuous dictation accumulated one per sentence.
+    timer?.cancel()
+    return result
 }
 
 /// Lets exactly one of two racing tasks resume the continuation. Resuming a

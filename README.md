@@ -113,7 +113,13 @@ Nothing is transcribed, inserted or written to disk unless you start a
 dictation. While idle, audio is kept for 0.3 s — so a syllable begun just before
 the key still arrives — and then discarded.
 
-Turn it off under **Keep Microphone Open** in the menu bar, or in
+It also closes itself. **Settings › General › Close it after** sets how long the
+microphone may go unused before Murmur releases it — 15 minutes by default, or
+**Never** to hold it open for as long as the app runs. The next press reopens
+it and pays the opening cost once, and the menu reads **Microphone: closed
+(idle)** so a shut device under a ticked switch is not mistaken for a fault.
+
+Turn it off entirely under **Keep Microphone Open** in the menu bar, or in
 **Settings › General**, at the cost of the first fraction of a second of each
 utterance.
 

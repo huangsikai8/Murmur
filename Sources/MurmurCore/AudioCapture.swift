@@ -60,7 +60,6 @@ public final class AudioCapture: @unchecked Sendable {
 
     private let levelLock = NSLock()
     private var level: Float = 0
-    private var levelSlices: [Float] = []
     private let spectrum = SpectrumAnalyser()
 
     /// Recent input loudness, 0...1, for the overlay's meter.
@@ -113,14 +112,6 @@ public final class AudioCapture: @unchecked Sendable {
     private var spectrumWanted = false
     private var levelSamples: [LevelSample] = []
 
-    public func drainLevels() -> [Float] {
-        levelLock.lock()
-        defer { levelLock.unlock() }
-        let slices = levelSlices
-        levelSlices.removeAll(keepingCapacity: true)
-        return slices
-    }
-
     /// Pieces each buffer is measured in. Four gives ~25 ms per bar on the
     /// 100 ms buffers this hardware delivers — fine enough to separate
     /// syllables, coarse enough that the work stays trivial on the audio
@@ -156,13 +147,77 @@ public final class AudioCapture: @unchecked Sendable {
     private var bufferSeconds: Double = 0
 
     /// Whether the input device is open right now.
+    ///
+    /// Asks the engine as well as this object's own flag. macOS stops the
+    /// engine out from under us on a configuration change — a device
+    /// appearing, a sample rate changing, waking from sleep — and the flag
+    /// alone would go on reporting a microphone that is shut. Everything that
+    /// decides whether to reopen reads this, so a lie here is a dictation that
+    /// records silence.
     public var isArmed: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return isRunning
+        return isRunning && engine.isRunning
     }
 
-    public init() {}
+    /// Where to report something the app should know about but cannot see.
+    /// `MurmurCore` has no logger of its own; the app supplies one.
+    public var diagnosticLog: (@Sendable (String) -> Void)?
+
+    private var configurationObserver: NSObjectProtocol?
+
+    public init() {
+        // AVAudioEngine stops itself when the audio configuration changes and
+        // does not start again. Unobserved, that is the microphone silently
+        // closing while every switch in the app still says it is open.
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            self?.handleConfigurationChange()
+        }
+    }
+
+    deinit {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+        }
+    }
+
+    /// Rebuilds the graph after macOS tore it down, and reopens the device if
+    /// it was open before.
+    ///
+    /// The tap goes with the engine, and the input format may be different on
+    /// the other side of this — so the converter is rebuilt rather than
+    /// reused, and whatever the pre-roll is holding was recorded in the old
+    /// format and is dropped for the same reason `prearm` drops it.
+    private func handleConfigurationChange() {
+        sinkLock.lock()
+        idleRoll.reset()
+        sinkLock.unlock()
+
+        lock.lock()
+        let wasOpen = isRunning
+        isRunning = false
+        tapInstalled = false
+        converter = nil
+        var failure: String?
+        if wasOpen {
+            do {
+                try startLocked()
+            } catch {
+                failure = error.localizedDescription
+            }
+        }
+        lock.unlock()
+
+        if let failure {
+            diagnosticLog?("audio configuration changed; microphone could not reopen: \(failure)")
+        } else if wasOpen {
+            diagnosticLog?("audio configuration changed; microphone reopened")
+        } else {
+            diagnosticLog?("audio configuration changed while the microphone was closed")
+        }
+    }
 
     /// Requests microphone permission, prompting on first call.
     public static func requestPermission() async -> Bool {
@@ -255,7 +310,6 @@ public final class AudioCapture: @unchecked Sendable {
         sinkLock.unlock()
         levelLock.lock()
         level = 0
-        levelSlices.removeAll(keepingCapacity: true)
         levelSamples.removeAll(keepingCapacity: true)
         levelLock.unlock()
     }
@@ -281,6 +335,15 @@ public final class AudioCapture: @unchecked Sendable {
     // MARK: - Device
 
     private func startLocked() throws {
+        // The engine is the authority on whether it is running. It stops
+        // itself on a configuration change, taking the tap with it, and a
+        // press that trusted the flag instead would install nothing, start
+        // nothing, and record nothing — while the overlay, the meter and
+        // the menu all behaved normally.
+        if !engine.isRunning, isRunning {
+            isRunning = false
+            tapInstalled = false
+        }
         // Only when there is no tap. Re-installing one on every press would
         // discard whatever buffer the device was part-way through filling,
         // which is the clipped first syllable coming back by another route.
@@ -464,7 +527,7 @@ public final class AudioCapture: @unchecked Sendable {
     /// to the eye. Speech sits far too low on a raw amplitude scale to read.
     ///
     /// Measured in slices rather than whole, so the meter can show what
-    /// happened *inside* a buffer — see `drainLevels`.
+    /// happened *inside* a buffer — see `drainLevelSamples`.
     private func updateLevel(from buffer: AVAudioPCMBuffer) {
         guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
         let seconds =
@@ -491,7 +554,6 @@ public final class AudioCapture: @unchecked Sendable {
             // 0.82 was, which is what keeps the meter from jittering now that
             // it is sampled four times as finely.
             level = measured > level ? measured : level * 0.82 + measured * 0.18
-            levelSlices.append(level)
             levelSamples.append(
                 LevelSample(
                     level: level,
@@ -506,9 +568,6 @@ public final class AudioCapture: @unchecked Sendable {
         }
         // A meter nobody is draining must not grow without bound — during
         // push-to-talk with a streaming engine there is no meter at all.
-        if levelSlices.count > Self.maximumBufferedLevels {
-            levelSlices.removeFirst(levelSlices.count - Self.maximumBufferedLevels)
-        }
         if levelSamples.count > Self.maximumBufferedLevels {
             levelSamples.removeFirst(levelSamples.count - Self.maximumBufferedLevels)
         }

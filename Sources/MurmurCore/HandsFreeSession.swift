@@ -149,18 +149,27 @@ public actor HandsFreeSession {
         guard let channel = buffer.floatChannelData?[0] else { return [] }
         let samples = Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
 
-        // Kept for every buffer, open or not, so the pre-roll the detector
-        // needed to confirm speech is already in the window when the turn
-        // detector is asked about it.
-        turnAudio.append(contentsOf: samples)
-        // Trimmed in blocks, not on every buffer. Holding the window to exactly
-        // 8 s means memmoving half a megabyte per buffer, roughly fifty times a
-        // second — the same cost `VoiceActivityDetector.process` already avoids
-        // by compacting once instead of per chunk. `WhisperFeatures.fit` takes
-        // the *suffix* it needs, so carrying a second of slack changes nothing
-        // the detector sees.
-        if turnAudio.count > WhisperFeatures.sampleCount + Self.turnAudioSlack {
-            turnAudio.removeFirst(turnAudio.count - WhisperFeatures.sampleCount)
+        // Only when something is going to read it. `turnAudio` is consumed in
+        // exactly one place — `endOfSpeech`, under `if let turnDetector` — so
+        // with the detector off, or its model failed to load, this was 576 KB
+        // held and half a megabyte memmoved a second for audio nobody asks
+        // about. `setTurnDetector` runs before `capture.start`, so no buffer
+        // can arrive while the answer to this is still unknown.
+        if turnDetector != nil {
+            // Kept for every buffer, open or not, so the pre-roll the detector
+            // needed to confirm speech is already in the window when the turn
+            // detector is asked about it.
+            turnAudio.append(contentsOf: samples)
+            // Trimmed in blocks, not on every buffer. Holding the window to
+            // exactly 8 s means memmoving half a megabyte per buffer, roughly
+            // fifty times a second — the same cost
+            // `VoiceActivityDetector.process` already avoids by compacting once
+            // instead of per chunk. `WhisperFeatures.fit` takes the *suffix* it
+            // needs, so carrying a second of slack changes nothing the detector
+            // sees.
+            if turnAudio.count > WhisperFeatures.sampleCount + Self.turnAudioSlack {
+                turnAudio.removeFirst(turnAudio.count - WhisperFeatures.sampleCount)
+            }
         }
 
         guard let boundaries = try? await detector.process(samples) else {

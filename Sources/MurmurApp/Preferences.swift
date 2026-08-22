@@ -24,6 +24,7 @@ final class Preferences: ObservableObject {
         static let turnSilenceMilliseconds = "murmur.turnSilenceMilliseconds"
         static let scratchEnabled = "murmur.scratchEnabled"
         static let keepMicrophoneArmed = "murmur.keepMicrophoneArmed"
+        static let microphoneIdleMinutes = "murmur.microphoneIdleMinutes"
         static let scratchWindowSeconds = "murmur.scratchWindowSeconds"
         static let meterStyle = "murmur.meterStyle"
     }
@@ -112,6 +113,16 @@ final class Preferences: ObservableObject {
         didSet { defaults.set(keepMicrophoneArmed, forKey: Key.keepMicrophoneArmed) }
     }
 
+    /// How long the held-open microphone may go unused before it is closed
+    /// anyway. Zero means never.
+    ///
+    /// The device costs nothing to hold open except the orange indicator, and
+    /// that is the whole reason for this: an indicator lit all evening for a
+    /// dictation nobody is going to make. The next press reopens it.
+    @Published var microphoneIdleMinutes: Int {
+        didSet { defaults.set(microphoneIdleMinutes, forKey: Key.microphoneIdleMinutes) }
+    }
+
     @Published var scratchEnabled: Bool {
         didSet { defaults.set(scratchEnabled, forKey: Key.scratchEnabled) }
     }
@@ -174,6 +185,9 @@ final class Preferences: ObservableObject {
             ?? .waveform
         keepMicrophoneArmed =
             (defaults.object(forKey: Key.keepMicrophoneArmed) as? Bool) ?? true
+        // `object(forKey:)`, so a deliberate "Never" survives a restart rather
+        // than reading as unset and reverting to the default.
+        microphoneIdleMinutes = (defaults.object(forKey: Key.microphoneIdleMinutes) as? Int) ?? 15
         let scratchWindow = defaults.integer(forKey: Key.scratchWindowSeconds)
         scratchWindowSeconds = scratchWindow > 0 ? scratchWindow : 60
         formatting =

@@ -20,8 +20,14 @@ enum Log {
 
     static func write(_ message: String) {
         let line = "\(formatter.string(from: Date()))  \(message)\n"
-        NSLog("[murmur] %@", message)
+        // The timestamp is taken here, on the caller, so the line still records
+        // when the event happened rather than when it was written. `NSLog` is
+        // not: it takes a global lock and writes to os_log and stderr
+        // synchronously, and one of its callers is the focus probe that runs
+        // between the final transcript and the paste. Moved onto the same
+        // serial queue as the file write, so the order of lines is unchanged.
         queue.async {
+            NSLog("[murmur] %@", message)
             guard let data = line.data(using: .utf8) else { return }
             if let handle = try? FileHandle(forWritingTo: fileURL) {
                 defer { try? handle.close() }

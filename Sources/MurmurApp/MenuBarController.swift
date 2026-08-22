@@ -312,6 +312,11 @@ final class MenuBarController {
         controller.scratchEnabled = preferences.scratchEnabled
         controller.meterStyle = preferences.meterStyle
         controller.keepMicrophoneArmed = preferences.keepMicrophoneArmed
+        controller.microphoneIdleTimeout = .seconds(preferences.microphoneIdleMinutes * 60)
+        // Setting the preference above only reacts to a *change*, so a
+        // device closed by something else stays closed. This is what
+        // notices.
+        controller.rearmMicrophoneIfNeeded()
         controller.scratchWindow = .seconds(preferences.scratchWindowSeconds)
         Task {
             await controller.applySpeechModel(preferences.activeSpeechModelID)
@@ -335,11 +340,19 @@ final class MenuBarController {
     /// actually open — which is what the user is really asking.
     private func syncMicrophoneItem() {
         microphoneItem.state = Preferences.shared.keepMicrophoneArmed ? .on : .off
+        // Opening the menu is also the cheapest moment to notice that the
+        // device is shut while the preference says otherwise, which is what a
+        // configuration change leaves behind.
+        controller.rearmMicrophoneIfNeeded()
         switch AudioCapture.systemReportsInputRunning {
         case true:
             microphoneStateItem.title = "Microphone: open"
         case false:
-            microphoneStateItem.title = "Microphone: closed"
+            // Says *why*, because "closed" with the switch ticked reads as a
+            // bug even when it is the timeout doing exactly its job.
+            microphoneStateItem.title =
+                controller.microphoneClosedWhileIdle
+                ? "Microphone: closed (idle)" : "Microphone: closed"
         default:
             microphoneStateItem.title = "Microphone: unknown"
         }

@@ -1910,4 +1910,98 @@ await runner.test("removing the tap releases the hand-off") {
     runner.expect(observed == nil, "removing the tap should release it")
 }
 
+// MARK: - Dictation history
+
+// The store itself was never the bug. What was recorded arrived correctly and
+// survived a restart; the settings window read it once and then showed that
+// same snapshot for the rest of the session, so a dictation made after the
+// window had been opened never appeared. Nothing here can see the view, so
+// what is tested is the signal the view now hangs off.
+
+runner.suite("Dictation history")
+
+func makeHistoryStore() -> HistoryStore {
+    let suite = "murmur.tests.history.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    return HistoryStore(defaults: defaults)
+}
+
+await runner.test("an inserted transcript is recorded newest first") {
+    let store = makeHistoryStore()
+    store.record("First one.")
+    store.record("Second one.")
+    runner.expectEqual(store.entries.map(\.text), ["Second one.", "First one."])
+}
+
+await runner.test("blank text is not recorded") {
+    let store = makeHistoryStore()
+    store.record("   \n  ")
+    runner.expectEqual(store.entries.count, 0)
+}
+
+await runner.test("history is capped rather than unbounded") {
+    let store = makeHistoryStore()
+    for index in 0..<(HistoryStore.limit + 5) { store.record("Line \(index).") }
+    runner.expectEqual(store.entries.count, HistoryStore.limit)
+    runner.expectEqual(store.entries.first?.text, "Line \(HistoryStore.limit + 4).")
+}
+
+// The regression: a view that reads the store once shows a list frozen at
+// whenever it first appeared. This is what tells it to read again.
+await runner.test("recording announces the change") {
+    let store = makeHistoryStore()
+    var announced = 0
+    let observer = NotificationCenter.default.addObserver(
+        forName: HistoryStore.didChangeNotification, object: store, queue: nil
+    ) { _ in announced += 1 }
+    defer { NotificationCenter.default.removeObserver(observer) }
+
+    store.record("Said something.")
+    store.record("Said something else.")
+    store.record("   ")
+
+    runner.expectEqual(announced, 2, "one announcement per recorded transcript")
+}
+
+// Posting while still holding the store's lock deadlocks any observer that
+// reacts by reading the list — which is exactly what the settings view does.
+await runner.test("an observer may read the history from the notification") {
+    let store = makeHistoryStore()
+    var seen: [String] = []
+    let observer = NotificationCenter.default.addObserver(
+        forName: HistoryStore.didChangeNotification, object: store, queue: nil
+    ) { notification in
+        guard let store = notification.object as? HistoryStore else { return }
+        seen = store.entries.map(\.text)
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+
+    store.record("Said something.")
+
+    runner.expectEqual(seen, ["Said something."])
+}
+
+// MARK: - The microphone held open between dictations
+
+// `isArmed` decides whether anything reopens the device, and macOS stops the
+// engine out from under this class on a configuration change — a device
+// appearing, waking from sleep. Believing our own flag over the engine left
+// the microphone shut while every switch in the app said it was open, and a
+// dictation in that state records silence: nothing reinstalls the tap and
+// nothing starts the engine. The real device is exercised by `--testmic`.
+
+runner.suite("Microphone arming")
+
+await runner.test("a capture that was never armed reports itself closed") {
+    let capture = AudioCapture()
+    runner.expect(!capture.isArmed, "nothing has opened the device yet")
+}
+
+await runner.test("stop leaves it closed and safe to repeat") {
+    let capture = AudioCapture()
+    capture.stop()
+    capture.stop()
+    runner.expect(!capture.isArmed, "stopping an unopened device must not claim it is open")
+}
+
 exit(runner.finish())

@@ -114,7 +114,7 @@ public final class SpectrumAnalyser: @unchecked Sendable {
         var result = [Float](repeating: 0, count: Self.bandCount)
 
         for band in 0..<Self.bandCount {
-            let (low, high) = Self.edges(of: band)
+            let (low, high) = Self.bandEdges[band]
             let firstBin = max(1, Int(low / binWidth))
             let lastBin = min(magnitudes.count - 1, Int(high / binWidth))
             guard firstBin <= lastBin else { continue }
@@ -153,6 +153,16 @@ public final class SpectrumAnalyser: @unchecked Sendable {
         let low = lowest * pow(ratio, Double(band))
         return (low, low * ratio)
     }
+
+    /// The same fourteen edges, computed once.
+    ///
+    /// `edges(of:)` costs two `pow` calls, and the band loop runs for every
+    /// slice — four to a buffer, ten buffers a second — so asking it each time
+    /// was ~1120 `pow` calls a second for numbers that never change. Held the
+    /// same way `tilt` already is, and from the same function, so the values
+    /// are identical to what the loop computed before.
+    private static let bandEdges: [(low: Double, high: Double)] =
+        (0..<bandCount).map { edges(of: $0) }
 
     /// Per-band gain, rising with frequency to offset the natural roll-off of
     /// speech. Measured by eye against a voice rather than derived: the point

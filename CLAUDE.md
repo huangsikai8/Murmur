@@ -73,7 +73,19 @@ microphone running and the *recognizer* being ready, which is ~15 ms, and sits
 entirely after it. `AudioCapture` therefore holds the device open between
 dictations and a press only swaps the sink, which measures **0.0-0.1 ms**; real
 sessions now log 1.3-7.3 ms end to end. The price is the orange microphone
-indicator staying lit, so `Preferences.keepMicrophoneArmed` can turn it off.
+indicator staying lit, so `Preferences.keepMicrophoneArmed` can turn it off,
+and `Preferences.microphoneIdleMinutes` (default 15, 0 = never) closes it again
+once it has gone that long unused — an indicator lit all evening for a
+dictation nobody is going to make is a claim on attention the app has not
+earned, and the next press pays the reopen once. That close is deliberate, so
+`DictationController.microphoneClosedWhileIdle` marks it and the self-healing
+below refuses to undo it; the menu says "Microphone: closed (idle)" rather than
+plain "closed", because the ticked switch over a shut device otherwise reads as
+the bug immediately below. The close is not punctual and does not need to be:
+measured at a 1-minute setting it fired at 63.7 s and 65.1 s, which is macOS
+coalescing the timer of a background `LSUIElement` process. Do not tighten this
+into a poll — nothing downstream cares about the exact second, and the whole
+point of the entry is to stop *wasting* the device.
 While idle the buffers go into a 300 ms rolling pre-roll and are discarded, and
 that pre-roll is replayed when a session starts — so a syllable begun just
 before the key still reaches the recognizer.
@@ -81,14 +93,36 @@ before the key still reaches the recognizer.
 **macOS keeps the microphone indicator lit after the device is released.** So
 switching `keepMicrophoneArmed` off and watching the menu bar looks exactly
 like the setting doing nothing — which is what it looked like, and it was
-working. Do not debug this from the indicator. `AudioCapture.isArmed` is only
-this app's bookkeeping; `AudioCapture.systemReportsInputRunning` asks CoreAudio
+working. Do not debug this from the indicator. `AudioCapture.isArmed` is this
+app's bookkeeping *reconciled with* `AVAudioEngine.isRunning`, for the reason
+in the next entry; `AudioCapture.systemReportsInputRunning` asks CoreAudio
 for `kAudioProcessPropertyIsRunningInput` on our own process, which is the
 signal the indicator itself follows. It is what the menu bar's "Microphone:
 open / closed" line reads, what `armMicrophone` and the preference log, and
 what `--testmic` asserts on — measured, `stop()` really does release the device
 and the property goes false. The property does not update synchronously with
 the stop, so every reader waits a moment first.
+
+**`AVAudioEngine` stops itself on a configuration change and never starts
+again.** A device appearing or disappearing, a sample rate changing, waking
+from sleep — macOS tears the graph down, removes the tap, and posts
+`AVAudioEngineConfigurationChange`. Nothing observed it, so `isRunning` and
+`tapInstalled` went on saying "open" forever. Two failures, and the quiet one
+is the worse: `armMicrophone`'s `guard !capture.isArmed` returned early, so the
+switch stayed ticked over a shut microphone (which is exactly what it looked
+like from the menu bar, since that line reads CoreAudio and CoreAudio was
+right); and `startLocked` skipped both the tap install and `engine.start()`, so
+a dictation in that state showed an overlay, moved the meter, and **recorded
+silence**. `AudioCapture` now observes the notification and rebuilds — new
+converter, since the input format may differ, and the pre-roll dropped for the
+same reason `prearm` drops it — while `isArmed` and `startLocked` treat the
+engine, not the flag, as the authority. `capture.diagnosticLog` is what puts
+any of this in `Murmur.log`; without it the only trace was the microphone
+behaving oddly some minutes later. `rearmMicrophoneIfNeeded` is the second
+half: `applyPreferences` only reacts to a *changed* preference, so a device
+closed by something else stayed closed, and it is now also called when the menu
+opens and after `fail()` — which closes the device to recover and never used to
+reopen it.
 
 **A pre-roll captured in one format must never be replayed into a session that
 asked for another.** Hands-free re-points the armed device at 16 kHz mono and
@@ -186,6 +220,16 @@ and replays it into the engine when speech is confirmed. Without it the first
 word of every utterance is lost — the same failure as Moonshine's missing last
 word, at the other end.
 
+**A view that reads a store once shows a list frozen at whenever it appeared.**
+`HistorySettings` loaded in `.onAppear`, and the settings window is built once
+and kept (`isReleasedWhenClosed = false`) — so it fired the first time that tab
+was shown and never again. Dictate, reopen settings, and the history is exactly
+as it was, which reads as transcripts not being recorded at all when in fact
+every one of them was stored correctly and survived restarts. `HistoryStore`
+now posts `didChangeNotification` and `HistoryModel` observes it. The post
+happens *outside* the store's lock: the observer reacts by reading `entries`,
+which takes that same lock.
+
 **`TextNormalizer.finalize` collapses newlines too.** It treats every
 whitespace character as collapsible, so running it over text containing a line
 break erases it. `SpokenFormatter` finalizes line by line, or "new line" would
@@ -272,6 +316,26 @@ five thin strokes rather than one solid shape like `mic.slash`, and a slash
 spanning the full width fragments every bar at once, which reads as broken
 rather than disabled. `barHeights` is duplicated between the glyph and
 `scripts/make-icon.swift` and has to be changed in both.
+
+**Saving the clipboard before a paste is free, and looks expensive.**
+`ClipboardPasteInserter` deep-copies every representation of every pasteboard
+item before it clears the board, which reads like tens of megabytes copied
+between the final transcript and the paste whenever a screenshot is on the
+clipboard. It is not: `NSPasteboardItem` data is copy-on-write, so the copy
+never touches the bytes. Measured — short text 0.013 ms, a 2880x1800 screenshot
+as TIFF alone (166 MB) 0.012 ms, the same as TIFF + PNG (167 MB) 0.059 ms. Do
+not "fix" this by snapshotting earlier and reusing it under a `changeCount`
+guard: it buys 0.06 ms and puts new logic in the one path that can destroy the
+user's clipboard. The snapshot is now skipped entirely unless the verdict is
+`.acceptsText`, which is the only path that restores.
+
+**`turnAudio` is the turn detector's window and nothing else's.**
+`HandsFreeSession` kept an 8-second rolling window for every buffer whether or
+not a detector existed — 576 KB resident and a ~512 KB memmove a second, for
+audio only `endOfSpeech` reads and only under `if let turnDetector`. It is
+maintained under the same condition now. Safe because `setTurnDetector` runs
+before `capture.start`, so no buffer can arrive while the answer is unknown;
+the ordering is what makes it safe, so do not move that call.
 
 ## Model-specific gotchas
 
@@ -469,7 +533,7 @@ text path.
 ```sh
 ./scripts/build-app.sh debug            # build + sign + assemble
 swift scripts/make-icon.swift           # regenerate the app icon (rarely needed)
-swift run MurmurTests                   # 123 tests, no Xcode needed
+swift run MurmurTests                   # 142 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --diagnose
 ./build/Murmur.app/Contents/MacOS/Murmur --selftest [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testcleanup
@@ -533,6 +597,15 @@ models being compared.
 
 `~/Library/Logs/Murmur.log` is rewritten each launch. A healthy start ends with
 `warmUp finished, status=idle`.
+
+Idle cost, measured on the resident menu-bar process with the microphone armed
+and nobody dictating: **0.07-0.08 s of CPU per 20 s of wall clock, ~0.4% of one
+core**. That is the number to beat before optimizing anything for idle — the
+per-buffer work is one conversion into the pre-roll, four `vDSP_measqv` passes
+and about a kilobyte of array churn, ten times a second, and it does not show
+up. Two rounds of tightening (dropping a dead per-slice array, hoisting the
+spectrum band edges out of the per-slice loop) moved this measurement not at
+all.
 
 ## Measured results, so regressions are visible
 

@@ -106,7 +106,9 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
         // the previous clipboard and never costs the transcript.
         let verdict = canReceiveText(targetProcess)
 
-        let saved = Self.snapshot(pasteboard)
+        // Only the accepting path restores, so on the other two this was a
+        // copy of the whole pasteboard taken to be discarded a few lines later.
+        let saved = verdict == .acceptsText ? Self.snapshot(pasteboard) : []
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)

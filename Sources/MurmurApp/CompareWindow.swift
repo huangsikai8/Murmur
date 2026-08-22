@@ -126,14 +126,16 @@ final class CompareViewModel: ObservableObject {
         return chosen.prefix(3).map { ModelComparison.BubbleConfig(speechModelID: $0.id) }
     }
 
-    private static func scanSpeechChoices() -> [AIModelDescriptor] {
-        let installed = ModelCatalog.installedModelIDs()
+    private static func scanSpeechChoices(
+        installed: Set<String> = ModelCatalog.installedModelIDs()
+    ) -> [AIModelDescriptor] {
         return ModelCatalog.models(in: .speechRecognition)
             .filter { $0.id == ModelCatalog.appleSpeechID || installed.contains($0.id) }
     }
 
-    private static func scanCleanupChoices() -> [AIModelDescriptor] {
-        let installed = ModelCatalog.installedModelIDs()
+    private static func scanCleanupChoices(
+        installed: Set<String> = ModelCatalog.installedModelIDs()
+    ) -> [AIModelDescriptor] {
         return ModelCatalog.models(in: .correction)
             .filter { $0.id == ModelCatalog.appleCorrectionID || installed.contains($0.id) }
     }
@@ -147,8 +149,12 @@ final class CompareViewModel: ObservableObject {
     /// The installed set only changes via the Settings Models tab, which cannot
     /// be reached without this window losing key focus and regaining it.
     func refreshChoices() {
-        speechChoices = Self.scanSpeechChoices()
-        cleanupChoices = Self.scanCleanupChoices()
+        // Walked once and handed to both. Answering "what is installed" sweeps
+        // every model cache on disk, and this runs on every return to the
+        // window; the two scans filter different catalogs from the same set.
+        let installed = ModelCatalog.installedModelIDs()
+        speechChoices = Self.scanSpeechChoices(installed: installed)
+        cleanupChoices = Self.scanCleanupChoices(installed: installed)
     }
 
     func addBubble() {
@@ -333,6 +339,11 @@ final class CompareViewModel: ObservableObject {
         isRecording = false
         isRunning = false
         recording = nil
+        // The raw take as well as the finished recording — a 30 s comparison
+        // holds ~1.9 MB of Float at 16 kHz, and the window is a bench that is
+        // meant to cost nothing once it is shut. `startRecording` assigns a
+        // fresh buffer, so nothing reuses what is dropped here.
+        buffer.reset()
         level = 0
     }
 }

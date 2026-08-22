@@ -116,6 +116,24 @@ private struct GeneralSettings: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+                if preferences.keepMicrophoneArmed {
+                    Picker("Close it after", selection: $preferences.microphoneIdleMinutes) {
+                        Text("Never").tag(0)
+                        Text("5 minutes").tag(5)
+                        Text("15 minutes").tag(15)
+                        Text("30 minutes").tag(30)
+                        Text("2 hours").tag(120)
+                    }
+                    .onChange(of: preferences.microphoneIdleMinutes) { _, _ in onChange() }
+                    Text(
+                        "Closes the microphone once it has gone this long unused, so the "
+                            + "indicator does not stay lit all evening. The next press "
+                            + "reopens it and pays the opening cost once."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                }
+
                 Picker("Hands-free toggle", selection: $preferences.handsFreeToggleShortcut) {
                     ForEach(ToggleShortcut.allCases) { shortcut in
                         Text(shortcut.displayName).tag(shortcut)
@@ -823,6 +841,26 @@ private final class HistoryModel: ObservableObject {
     @Published var entries: [HistoryEntry] = []
 
     private let store = HistoryStore.shared
+    private var observer: NSObjectProtocol?
+
+    /// Reads the store on every insertion, not only when the view appears.
+    ///
+    /// The settings window is created once and kept (`isReleasedWhenClosed`
+    /// is false), so `onAppear` fires the first time this tab is shown and
+    /// never again — dictate, reopen settings, and the list is exactly as it
+    /// was. That looked like history not being recorded at all.
+    init() {
+        entries = store.entries
+        observer = NotificationCenter.default.addObserver(
+            forName: HistoryStore.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.load() }
+        }
+    }
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
 
     func load() { entries = store.entries }
 }

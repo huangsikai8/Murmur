@@ -22,6 +22,14 @@ public final class HistoryStore: @unchecked Sendable {
     public static let shared = HistoryStore()
     public static let limit = 20
 
+    /// Posted after an entry is recorded.
+    ///
+    /// The settings window is built once and reused, so a view that reads the
+    /// store when it appears reads it exactly once and then shows a list that
+    /// never changes again — which is a history of everything dictated
+    /// before the window was first opened, and nothing since.
+    public static let didChangeNotification = Notification.Name("murmur.historyDidChange")
+
     private let defaultsKey = "murmur.history"
     private let defaults: UserDefaults
     private let lock = NSLock()
@@ -47,12 +55,16 @@ public final class HistoryStore: @unchecked Sendable {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         lock.lock()
-        defer { lock.unlock() }
         storage.insert(HistoryEntry(text: trimmed), at: 0)
         if storage.count > Self.limit {
             storage.removeLast(storage.count - Self.limit)
         }
         persist()
+        lock.unlock()
+        // Posted outside the lock: an observer reads `entries` to react, and
+        // doing that from inside would deadlock on a lock this call still
+        // holds.
+        NotificationCenter.default.post(name: Self.didChangeNotification, object: self)
     }
 
     /// Caller already holds the lock.

@@ -148,6 +148,12 @@ final class DictationController {
         self.engine = engine
         self.cleaner = cleaner
         self.inserter = inserter
+        // macOS tears the audio graph down on a configuration change, and
+        // `AudioCapture` rebuilds it; without this the only record of either
+        // is the microphone behaving oddly some minutes later.
+        capture.diagnosticLog = { message in
+            Task { @MainActor in Log.write(message) }
+        }
     }
 
     /// Loads models and pre-builds the audio graph so the first dictation is
@@ -170,13 +176,18 @@ final class DictationController {
 
     /// Switches the cleanup model, loading it if needed.
     func applyCorrectionModel(_ modelID: String) async {
+        // Asked before anything is built. `applyPreferences` calls this on
+        // every preference change, and `FoundationModelsCleaner.init`
+        // constructs a `SystemLanguageModel` — so every unrelated toggle in
+        // Settings used to build a cleaner and drop it on the next line.
+        guard modelID != activeCorrectionModelID else { return }
+
         let desired: any TranscriptCleaner
         if let variant = MLXCleaner.Variant.from(modelID: modelID) {
             desired = MLXCleaner(variant: variant)
         } else {
             desired = FoundationModelsCleaner()
         }
-        guard modelID != activeCorrectionModelID else { return }
 
         let switchStart = ContinuousClock.now
         await cleaner.releaseModels()
@@ -312,6 +323,7 @@ final class DictationController {
             return
         }
         latency.mark(.microphoneRunning)
+        noteMicrophoneUse()
 
         buffer.reset()
         focusTarget = FocusTracker.capture()
@@ -344,22 +356,107 @@ final class DictationController {
             if keepMicrophoneArmed {
                 armMicrophone()
             } else if !isActive, !isHandsFree {
+                microphoneIdleTask?.cancel()
+                microphoneIdleTask = nil
                 capture.stop()
                 logMicrophoneState("keep-open switched off, microphone closed")
             }
         }
     }
 
+    /// How long the armed microphone may sit unused before it is closed
+    /// anyway. Zero holds it open indefinitely, which is what this used to do.
+    ///
+    /// Holding the device open costs the front of no utterance and buys a
+    /// press that measures 0.0-0.1 ms, so the only reason to give it up is the
+    /// orange indicator: a microphone lit all evening for a dictation nobody
+    /// is going to make is a claim on the user's attention this app has not
+    /// earned. The next press reopens it and pays the device cost once.
+    var microphoneIdleTimeout: Duration = .seconds(900) {
+        didSet {
+            guard microphoneIdleTimeout != oldValue else { return }
+            startMicrophoneIdleWatch()
+        }
+    }
+
+    /// Whether the microphone is shut because it was idle, rather than because
+    /// something went wrong.
+    ///
+    /// The two look identical from outside — preference on, device closed —
+    /// and anything that heals the second must not undo the first, or the
+    /// timeout closes the device and the next menu open reopens it.
+    private(set) var microphoneClosedWhileIdle = false
+    private var lastMicrophoneUseAt = ContinuousClock.now
+    private var microphoneIdleTask: Task<Void, Never>?
+
     /// Opens the input device ahead of any key, if that is what the user asked
     /// for. Failing is not fatal: a dictation opens it itself, slowly.
     func armMicrophone() {
         guard keepMicrophoneArmed, !isHandsFree else { return }
-        guard !capture.isArmed else { return }
+        guard !capture.isArmed else {
+            // Already open. The countdown must be running, but it must not be
+            // pushed back: this is also reached by a model swap, and swapping
+            // a model is not the microphone being used.
+            startMicrophoneIdleWatch()
+            return
+        }
         do {
             try capture.arm()
+            noteMicrophoneUse()
             logMicrophoneState("microphone armed; a press now costs a sink swap")
         } catch {
             Log.write("microphone could not be armed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Reopens a microphone that was closed by something other than the idle
+    /// timeout — a configuration change, or a session that failed.
+    ///
+    /// Idempotent, and deliberately refuses to fight the timeout: a device the
+    /// timeout closed stays closed until the user presses the key.
+    func rearmMicrophoneIfNeeded() {
+        guard keepMicrophoneArmed, !isHandsFree, !isActive else { return }
+        guard !microphoneClosedWhileIdle, !capture.isArmed else { return }
+        Log.write("microphone was closed with keep-open on; reopening")
+        armMicrophone()
+    }
+
+    /// Restarts the idle countdown. Called wherever the microphone is used, so
+    /// "idle" means what the user would mean by it.
+    private func noteMicrophoneUse() {
+        lastMicrophoneUseAt = ContinuousClock.now
+        microphoneClosedWhileIdle = false
+        startMicrophoneIdleWatch()
+    }
+
+    /// Closes the armed microphone once it has gone unused for long enough.
+    ///
+    /// Sleeps the remaining time rather than polling, and re-checks on waking
+    /// because a dictation during the sleep moves the deadline instead of
+    /// cancelling the task.
+    private func startMicrophoneIdleWatch() {
+        microphoneIdleTask?.cancel()
+        microphoneIdleTask = nil
+        guard keepMicrophoneArmed, microphoneIdleTimeout > .zero else { return }
+        microphoneIdleTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let remaining =
+                    self.microphoneIdleTimeout - (ContinuousClock.now - self.lastMicrophoneUseAt)
+                if remaining > .zero {
+                    try? await Task.sleep(for: remaining)
+                    continue
+                }
+                guard !Task.isCancelled, self.keepMicrophoneArmed else { return }
+                // A dictation running now is exactly the opposite of idle, and
+                // hands-free owns the device on its own terms.
+                guard !self.isActive, !self.isHandsFree, self.capture.isArmed else { return }
+                self.microphoneClosedWhileIdle = true
+                self.capture.stop()
+                self.logMicrophoneState(
+                    "microphone idle for \(self.microphoneIdleTimeout), closed")
+                return
+            }
         }
     }
 
@@ -385,6 +482,9 @@ final class DictationController {
     private func releaseMicrophone() {
         if keepMicrophoneArmed {
             capture.idle()
+            // The countdown to closing an unused device starts here, at the
+            // end of a dictation, not when it was opened.
+            noteMicrophoneUse()
         } else {
             capture.stop()
         }
@@ -1186,5 +1286,9 @@ final class DictationController {
         try? await Task.sleep(for: .milliseconds(1200))
         overlay.hide()
         status = .idle
+        // The device was closed to recover, so with keep-open on it has to be
+        // reopened — otherwise a single failed session silently costs every
+        // later press the reopen this preference exists to avoid.
+        rearmMicrophoneIfNeeded()
     }
 }
