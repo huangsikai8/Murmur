@@ -860,6 +860,105 @@ await runner.test("peak loudness follows the loudest moment, not the average") {
     runner.expectEqual(quiet < -100, true, "digital silence measured \(quiet) dBFS")
 }
 
+// MARK: - Whisper over a hold longer than one window
+
+runner.suite("Whisper long holds")
+
+// Whisper decodes a fixed 30-second window, and WhisperKit walks a longer
+// recording by seeking to the last timestamp it was given. Asked to decode
+// without timestamps, `SegmentSeeker` has nothing to seek by and falls back to
+// `seek += segmentSize`, jumping a whole window — so whatever the decoder
+// stopped short of inside that window is dropped. Measured on Large v3 Turbo
+// over 57 s, 92 s and 171 s of speech: a clause went missing at every boundary,
+// and returned the moment timestamps were on. Nothing else in the app reads a
+// timestamp, so this flag looks free to turn off and is not.
+await runner.test("the decoder is asked for timestamps") {
+    runner.expectEqual(WhisperEngine.decodesWithTimestamps, true)
+}
+
+// The price of the line above: with timestamps on the model also emits its
+// captioning annotations, as ordinary text that `skipSpecialTokens` never sees.
+await runner.test("non-speech annotations are removed") {
+    for annotation in [
+        "[BLANK_AUDIO]", "[ Silence ]", "[MUSIC PLAYING]", "(applause)",
+        "[Laughter]", "[inaudible]", "(coughs)", "[BLANK _ AUDIO]",
+    ] {
+        runner.expectEqual(
+            WhisperEngine.stripNonSpeechAnnotations("Hello there. " + annotation).trimmingCharacters(
+                in: .whitespaces),
+            "Hello there.", "\(annotation) survived")
+    }
+}
+
+await runner.test("an annotation mid-transcript leaves the words either side") {
+    let stripped = WhisperEngine.stripNonSpeechAnnotations(
+        "with nothing unusual in it. [BLANK_AUDIO] The second marker word.")
+    runner.expectEqual(
+        TextNormalizer.finalize(stripped),
+        "with nothing unusual in it. The second marker word.")
+}
+
+// The brackets alone must never be the test: `SpokenFormatter` has no rule that
+// produces one, so a bracket in a transcript is either the model annotating or
+// the speaker dictating, and punctuation cannot tell those apart.
+await runner.test("bracketed text the speaker dictated is kept") {
+    for kept in [
+        "Ship it [TODO: check the date] tomorrow.",
+        "The array is items[0] and items[1].",
+        "Call foo(bar) when ready.",
+        "See the note (the one from Tuesday) below.",
+        "A stray [ bracket that never closes",
+    ] {
+        runner.expectEqual(WhisperEngine.stripNonSpeechAnnotations(kept), kept)
+    }
+}
+
+await runner.test("ordinary transcripts pass through untouched") {
+    for sentence in referenceSentences {
+        runner.expectEqual(WhisperEngine.stripNonSpeechAnnotations(sentence), sentence)
+    }
+}
+
+// Whisper fills trailing silence with whatever its captioned training data said
+// next — "Thank you.", "you" — appended to a real transcript, where
+// `isInventedSilence` cannot touch it because it may only drop a hold entire.
+// With timestamps on, the segment's own audio settles it.
+await runner.test("a segment decoded from silence is not audible") {
+    var samples = [Float](repeating: 0, count: 16000 * 4)
+    // A voice in the first second, nothing after it.
+    for frame in 0..<16000 { samples[frame] = sin(Float(frame) * 0.1) * 0.2 }
+
+    runner.expectEqual(WhisperEngine.spansAudibleAudio(samples, from: 0, to: 1), true)
+    runner.expectEqual(WhisperEngine.spansAudibleAudio(samples, from: 1.5, to: 4), false)
+    runner.expectEqual(WhisperEngine.spansAudibleAudio(samples, from: 0.5, to: 2.5), true)
+}
+
+// An out-of-range or inverted timestamp is a reason to distrust the timestamp,
+// never to throw away words.
+await runner.test("an unmeasurable span keeps its words") {
+    let samples = [Float](repeating: 0, count: 16000)
+    runner.expectEqual(WhisperEngine.spansAudibleAudio(samples, from: 5, to: 9), true)
+    runner.expectEqual(WhisperEngine.spansAudibleAudio(samples, from: 2, to: 1), true)
+    runner.expectEqual(WhisperEngine.spansAudibleAudio([], from: 0, to: 1), true)
+}
+
+// Quiet speech is still speech: the ceiling sits below any voice, not near it.
+await runner.test("a quietly spoken segment is kept") {
+    var samples = [Float](repeating: 0, count: 16000 * 2)
+    // -34 dBFS, well under conversational level and well over the -45 ceiling.
+    for frame in 0..<samples.count { samples[frame] = sin(Float(frame) * 0.1) * 0.02 }
+    runner.expectEqual(WhisperEngine.spansAudibleAudio(samples, from: 0, to: 2), true)
+}
+
+// A hold that produced nothing but an annotation must insert nothing, which is
+// the existing guard doing its job once the annotation is gone.
+await runner.test("an annotation on its own carries no words") {
+    for alone in ["[BLANK_AUDIO]", "[ Silence ]", "(music)"] {
+        let stripped = TextNormalizer.finalize(WhisperEngine.stripNonSpeechAnnotations(alone))
+        runner.expectEqual(WhisperEngine.carriesWords(stripped), false, alone)
+    }
+}
+
 // MARK: - Model catalog
 
 runner.suite("Model catalog")

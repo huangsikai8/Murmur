@@ -48,6 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // otherwise invisible: the answer lives in the accessibility tree of
         // whatever happened to be frontmost at the time.
         ClipboardPasteInserter.diagnostics = { Log.write($0) }
+        // A batch engine returns one string and says nothing about the audio it
+        // was handed, so a hold that comes back far shorter than it was spoken
+        // is indistinguishable from a hold in which little was said.
+        WhisperEngine.diagnosticLog = { Log.write($0) }
         ModelCatalog.coreMLEngineWired = true
         // MLX is compiled in, so the downloadable language models may be offered.
         ModelCatalog.mlxSupported = true

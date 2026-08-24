@@ -383,6 +383,37 @@ the ordering is what makes it safe, so do not move that call.
   as a *whole transcript* and only below **-38 dBFS**, so saying thank you out
   loud keeps it. Peak, not average: a sentence is mostly gaps, and averaging
   pulls a real utterance down towards the room it was spoken in.
+* **`withoutTimestamps` is not free, and nothing in the app reads a timestamp.**
+  Whisper decodes a fixed 30-second window; WhisperKit walks anything longer by
+  seeking to the last timestamp the decoder emitted. Asked to decode without
+  them, `SegmentSeeker` has nothing to seek by and falls into
+  `seek += segmentSize`, jumping a whole window — so everything the decoder
+  stopped short of inside that window is dropped. No error, no warning, and the
+  transcript reads perfectly well straight across the hole:
+
+      … with nothing unusual in it at all. in the middle of the audio. I am …
+                                          ^ one clause gone
+
+  Measured on Large v3 Turbo over 57 s, 92 s and 171 s of speech: a clause
+  vanished at every boundary and came back the moment timestamps were on, at no
+  cost in time (4863 ms against 5641 ms). Base and Small survived synthesized
+  speech either way, which is why `--selftest` never saw it — every other speech
+  test here says one sentence and releases, so the seek loop was exercised by
+  nothing at all. `--testlong` is the one that holds past 30 s.
+* **Timestamps on means annotations and fillers, and both are answerable.**
+  In that mode the model also emits `[BLANK_AUDIO]`, `[ Silence ]` and
+  `(applause)` — ordinary text tokens, so `skipSpecialTokens` never touches
+  them — and appends "Thank you." or "you" to a real transcript when the hold
+  ended in silence. `stripNonSpeechAnnotations` removes the first by matching
+  the *whole* bracketed span against a fixed list, never on the brackets alone:
+  `SpokenFormatter` has no rule that produces a bracket, so one in a transcript
+  is either the model annotating or the speaker dictating, and punctuation
+  cannot tell those apart. The second is what `spansAudibleAudio` is for, and it
+  is the guard timestamps make possible: a segment is dropped when *its own*
+  span of audio is below the -45 dBFS ceiling. That is strictly better than
+  matching phrases, which is why `isInventedSilence` may still only drop a hold
+  entire — a real sentence elsewhere in the recording cannot vouch for a segment
+  decoded out of nothing.
 * **WhisperKit's variant folders are not a pattern.** `openai_whisper-small.en`
   next to `openai_whisper-large-v3-v20240930`, which is large-v3-turbo under its
   release date, and quantized siblings like `openai_whisper-small.en_217MB` sit
@@ -547,7 +578,7 @@ text path.
 ```sh
 ./scripts/build-app.sh debug            # build + sign + assemble
 swift scripts/make-icon.swift           # regenerate the app icon (rarely needed)
-swift run MurmurTests                   # 142 tests, no Xcode needed
+swift run MurmurTests                   # 151 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --diagnose
 ./build/Murmur.app/Contents/MacOS/Murmur --selftest [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testcleanup
@@ -558,6 +589,7 @@ swift run MurmurTests                   # 142 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --testtail [modelID] [--clip ms]
 ./build/Murmur.app/Contents/MacOS/Murmur --testhandsfree [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testsilence [modelID]
+./build/Murmur.app/Contents/MacOS/Murmur --testlong [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testhomophones
 ./build/Murmur.app/Contents/MacOS/Murmur --testcompare [seconds] \
     [--say "sentence"] [--cleanup modelID]
@@ -586,6 +618,15 @@ nothing.
 `--testsilence` holds the key with nobody speaking, in four flavours of room
 tone, and every result must be empty — words there are words nobody said. It
 exists because Whisper produces them and nothing upstream stops it.
+
+`--testlong` holds for one utterance of eight sentences with pauses between
+them — 48 s, so it crosses a 30-second window boundary that every other speech
+test here stops short of. Each sentence carries a distinct marker word, and a
+missing marker is a sentence thrown away rather than a word misheard, which is
+the only way that failure is visible at all. It also prints the engine's own
+report of what it was handed, so the words-per-second figure a real session
+writes to `Murmur.log` is exercised by a test. With no model ID it runs every
+installed Whisper variant.
 
 `--testcompare` records once and replays that one recording through every
 installed speech model in turn, then prints them side by side with the contested
@@ -638,6 +679,20 @@ one run taken minutes after the download: re-measured warm, Turbo gives
 834/756/865/849 ms and 808/843/797/744 ms with no first-decode spike at all. A
 warm-up pass in `prepare()` would buy nothing. Measured on disk: Base 146 MB,
 Turbo 1569 MB, each including a ~3 MB tokenizer from a second repository.
+
+Long holds, `--testlong`, one 48.4 s utterance of 8 sentences with 2.5 s pauses:
+Base, Small and Large v3 Turbo each keep all 8 marker words, at 2.5–2.6 words/s
+against the 2.5 words/s that went in. Decode 843 ms / 1963 ms / 4057 ms. Before
+timestamps were turned on, Turbo dropped a clause at the boundary in every run
+and the other two survived synthesized speech, so a test on Base alone would
+have reported this fixed while it was not.
+
+A real session that returns far fewer words than were spoken now says so:
+`whisper small: 48.4 s audio, peak -12.4 dBFS, decoded in 1963 ms -> 123 words
+(2.54 words/s)` goes into `Murmur.log` on every hold. Ordinary dictation runs at
+2–3 words/s; the failure this exists to catch read 0.14 words/s over a
+41.7-second hold and was indistinguishable, from the outside, from a hold in
+which almost nothing was said.
 
 Parakeet TDT v2 is the one non-streaming entry: it emits nothing while you speak
 and decodes on release, in 81–104 ms for a short sentence, after a 253 ms load.

@@ -116,6 +116,17 @@ if let index = CommandLine.arguments.firstIndex(of: "--testtail") {
     exit(runBlocking { await TailTest.run(modelID: modelID, extraClipMs: extraClipMs) })
 }
 
+// `--testlong [modelID]` holds for longer than Whisper's 30 s window. Every
+// other speech test says one sentence and releases, so the seek loop that
+// stitches windows together was exercised by nothing at all.
+if let index = CommandLine.arguments.firstIndex(of: "--testlong") {
+    let modelID =
+        CommandLine.arguments.count > index + 1
+        && !CommandLine.arguments[index + 1].hasPrefix("--")
+        ? CommandLine.arguments[index + 1] : nil
+    exit(runBlocking { await LongHoldTest.run(modelID: modelID) })
+}
+
 if CommandLine.arguments.contains("--testhomophones") {
     exit(runBlocking { await CleanupTest.runHomophones() })
 }
