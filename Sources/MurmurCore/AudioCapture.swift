@@ -201,7 +201,12 @@ public final class AudioCapture: @unchecked Sendable {
         tapInstalled = false
         converter = nil
         var failure: String?
-        if wasOpen {
+        // A device switching to Bluetooth mid-session — someone's headset
+        // reconnecting — must not be silently followed: opening its mic
+        // forces the whole link into a low-quality voice profile, degrading
+        // whatever else is playing through it, for as long as it stays open.
+        let declineBluetooth = wasOpen && Self.defaultInputIsBluetooth
+        if wasOpen, !declineBluetooth {
             do {
                 try startLocked()
             } catch {
@@ -212,6 +217,9 @@ public final class AudioCapture: @unchecked Sendable {
 
         if let failure {
             diagnosticLog?("audio configuration changed; microphone could not reopen: \(failure)")
+        } else if declineBluetooth {
+            diagnosticLog?(
+                "audio configuration changed; default input is now Bluetooth, staying closed")
         } else if wasOpen {
             diagnosticLog?("audio configuration changed; microphone reopened")
         } else {
@@ -634,5 +642,43 @@ extension AudioCapture {
         )
         guard read == noErr else { return nil }
         return value != 0
+    }
+
+    /// Whether the system's current default input device connects over
+    /// Bluetooth.
+    ///
+    /// AirPods and similar headsets cannot run their high-quality output
+    /// profile at the same time as their microphone: opening the mic input
+    /// forces macOS to renegotiate the whole link down to a mono voice
+    /// profile, audible on anything else using the same device — music, a
+    /// call — for as long as the input stays open.
+    public static var defaultInputIsBluetooth: Bool {
+        var deviceAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let deviceRead = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &deviceAddress, 0, nil, &size, &deviceID
+        )
+        guard deviceRead == noErr, deviceID != AudioObjectID(kAudioObjectUnknown) else {
+            return false
+        }
+
+        var transportAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transportType: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        let transportRead = AudioObjectGetPropertyData(
+            deviceID, &transportAddress, 0, nil, &size, &transportType
+        )
+        guard transportRead == noErr else { return false }
+        return transportType == kAudioDeviceTransportTypeBluetooth
+            || transportType == kAudioDeviceTransportTypeBluetoothLE
     }
 }

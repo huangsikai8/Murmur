@@ -291,6 +291,16 @@ final class DictationController {
     func begin() {
         guard !isActive, !isHandsFree else { return }
         if case .unavailable = status { return }
+        // Opening a Bluetooth input forces the whole link into a low-quality
+        // voice profile — audible on anything else playing through it — and
+        // that renegotiation is also where a wedged headset has hung this
+        // app outright. Refusing to touch it here means neither can happen;
+        // dictation stays unavailable until the input switches back.
+        guard !AudioCapture.defaultInputIsBluetooth else {
+            Log.write("dictation press ignored: default input is Bluetooth")
+            announce(.error("Bluetooth microphone not supported — switch input to dictate"))
+            return
+        }
         isActive = true
         sessionToken &+= 1
 
@@ -391,8 +401,15 @@ final class DictationController {
 
     /// Opens the input device ahead of any key, if that is what the user asked
     /// for. Failing is not fatal: a dictation opens it itself, slowly.
+    ///
+    /// Refuses on a Bluetooth input: holding it open would force the whole
+    /// link into a low-quality voice profile for as long as it stays armed,
+    /// audibly degrading anything else playing through it — the wrong trade
+    /// for something meant to sit open indefinitely between dictations.
     func armMicrophone() {
-        guard keepMicrophoneArmed, !isHandsFree else { return }
+        guard keepMicrophoneArmed, !isHandsFree, !AudioCapture.defaultInputIsBluetooth else {
+            return
+        }
         guard !capture.isArmed else {
             // Already open. The countdown must be running, but it must not be
             // pushed back: this is also reached by a model swap, and swapping
@@ -660,6 +677,18 @@ final class DictationController {
     func startHandsFree() async {
         guard !isHandsFree, !isActive else { return }
         if case .unavailable = status { return }
+        // Hands-free holds the microphone open continuously — the same
+        // Bluetooth-profile and stuck-`engine.start()` exposure as keeping
+        // push-to-talk armed, for the whole time it runs rather than briefly.
+        // A plain early return rather than `.unavailable`: that status is a
+        // hard gate `begin()` also checks, and nothing resets it once set, so
+        // it would silently block ordinary dictation even after the
+        // Bluetooth device disconnects.
+        guard !AudioCapture.defaultInputIsBluetooth else {
+            Log.write("hands-free not started: default input is Bluetooth")
+            announce(.error("Bluetooth microphone not supported for hands-free"))
+            return
+        }
 
         status = .preparing
         let session = HandsFreeSession(
