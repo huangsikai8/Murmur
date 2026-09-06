@@ -25,11 +25,13 @@ public final class AudioCapture: @unchecked Sendable {
     public enum CaptureError: LocalizedError {
         case microphoneDenied
         case converterUnavailable
+        case deviceBusy
 
         public var errorDescription: String? {
             switch self {
             case .microphoneDenied: "Microphone access was denied."
             case .converterUnavailable: "Could not convert microphone audio to the engine's format."
+            case .deviceBusy: "The audio device is still switching — try again in a moment."
             }
         }
     }
@@ -60,6 +62,17 @@ public final class AudioCapture: @unchecked Sendable {
 
     private let levelLock = NSLock()
     private var level: Float = 0
+    /// Audio in this session loud enough to have been somebody speaking.
+    ///
+    /// Measured here rather than derived from the meter, because the meter is
+    /// not always running — `startMeter` returns early for an engine that
+    /// streams live text — and it drops its backlog on purpose. This counts
+    /// every slice `updateLevel` measures anyway, so it costs a comparison.
+    private var speechSecondsMeasured: Double = 0
+    /// Whether a dictation owns the microphone. Idle audio goes into the
+    /// pre-roll and is thrown away, and must not be counted as anybody
+    /// speaking.
+    private var capturing = false
     private let spectrum = SpectrumAnalyser()
 
     /// Recent input loudness, 0...1, for the overlay's meter.
@@ -155,7 +168,10 @@ public final class AudioCapture: @unchecked Sendable {
     /// decides whether to reopen reads this, so a lie here is a dictation that
     /// records silence.
     public var isArmed: Bool {
-        lock.lock()
+        // Read from the menu on the main thread, so it is bounded like every
+        // other main-thread caller. A device mid-change reports itself closed,
+        // which is the honest answer while the graph is being rebuilt.
+        guard acquireLockOrSkip(for: "reading whether the microphone is open") else { return false }
         defer { lock.unlock() }
         return isRunning && engine.isRunning
     }
@@ -166,6 +182,12 @@ public final class AudioCapture: @unchecked Sendable {
 
     private var configurationObserver: NSObjectProtocol?
 
+    /// Where a configuration change is reacted to. Serial, so a burst of them —
+    /// which is what changing audio device actually produces — rebuilds the
+    /// graph once at a time rather than concurrently.
+    private let configurationQueue = DispatchQueue(
+        label: "com.sikaihuang.murmur.audio-configuration")
+
     public init() {
         // AVAudioEngine stops itself when the audio configuration changes and
         // does not start again. Unobserved, that is the microphone silently
@@ -173,7 +195,22 @@ public final class AudioCapture: @unchecked Sendable {
         configurationObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
         ) { [weak self] _ in
-            self?.handleConfigurationChange()
+            // **Never react on this thread.** `queue: nil` delivers the
+            // notification *synchronously on whatever thread posted it*, and
+            // AVAudioEngine posts this one from its own internal audio thread
+            // while it is part-way through reconfiguring itself. Calling
+            // `engine.start()` or `installTap` from in here is a reentrant call
+            // into an engine that is still holding its own state down, and it
+            // blocks — with `lock` held, so the next press on the main thread
+            // blocks behind it and the app stops answering entirely.
+            //
+            // Measured: unplugging Bluetooth and switching to the built-in
+            // output produced a burst of these, `main thread stalled past 1.0 s`
+            // in the log immediately after, and no recovery — the app had to be
+            // force-quit. The reaction is the same work, done anywhere else.
+            self?.configurationQueue.async { [weak self] in
+                self?.handleConfigurationChange()
+            }
         }
     }
 
@@ -247,7 +284,7 @@ public final class AudioCapture: @unchecked Sendable {
     /// 16 kHz mono where push-to-talk asks for whatever the engine wants, and a
     /// stale tap would go on delivering the previous format.
     public func prearm(targetFormat: AVAudioFormat?) {
-        lock.lock()
+        guard acquireLockOrSkip(for: "pre-arming") else { return }
         defer { lock.unlock() }
         guard targetFormat != self.targetFormat || !tapInstalled else { return }
         self.targetFormat = targetFormat
@@ -281,7 +318,7 @@ public final class AudioCapture: @unchecked Sendable {
     /// Buffers go into the pre-roll and are discarded as it rolls over. The
     /// point is that the device is *already running* when a dictation starts.
     public func arm() throws {
-        lock.lock()
+        try acquireLock(for: "arming the microphone")
         defer { lock.unlock() }
         try startLocked()
     }
@@ -294,9 +331,14 @@ public final class AudioCapture: @unchecked Sendable {
     /// one has finished its trailing capture would otherwise keep the old
     /// session's sink and deliver nothing to the new one.
     public func start(onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void) throws {
-        lock.lock()
+        try acquireLock(for: "starting a dictation")
         defer { lock.unlock() }
         try startLocked()
+
+        levelLock.lock()
+        speechSecondsMeasured = 0
+        capturing = true
+        levelLock.unlock()
 
         sinkLock.lock()
         // Drained and installed under one lock, in order, for the same reason
@@ -305,6 +347,26 @@ public final class AudioCapture: @unchecked Sendable {
         sink = onBuffer
         sinkLock.unlock()
     }
+
+    /// How much of the session just captured sounded like speech.
+    ///
+    /// Survives the end of the session on purpose: it is read after the
+    /// transcript comes back, which is the only moment it answers anything.
+    /// The question it answers is the one a peak cannot — a peak is the
+    /// loudest 25 ms, so one door closing in a silent room reads the same as
+    /// somebody talking for six seconds.
+    public var speechSeconds: Double {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        return speechSecondsMeasured
+    }
+
+    /// Loudness at which audio is taken to be somebody speaking, on the curve
+    /// `loudness(ofRMS:)` draws — roughly -33 dBFS, which is quiet speech.
+    ///
+    /// One number, in one place: the curve has moved twice already, and the
+    /// same constant means a different loudness on each one.
+    public static let speechLevel: Float = 0.2
 
     /// Stops delivering to the session's sink without closing the device.
     ///
@@ -319,6 +381,10 @@ public final class AudioCapture: @unchecked Sendable {
         levelLock.lock()
         level = 0
         levelSamples.removeAll(keepingCapacity: true)
+        // `speechSecondsMeasured` is deliberately kept: the session that just
+        // ended is exactly what it describes, and it is read once the
+        // transcript is back.
+        capturing = false
         levelLock.unlock()
     }
 
@@ -329,7 +395,7 @@ public final class AudioCapture: @unchecked Sendable {
         // for nothing. Released rather than left to time out: the device
         // closing is the answer to their question.
         releaseDeliveryWaiters()
-        lock.lock()
+        guard acquireLockOrSkip(for: "closing the microphone") else { return }
         defer { lock.unlock() }
         guard isRunning else { return }
         engine.inputNode.removeTap(onBus: 0)
@@ -341,6 +407,58 @@ public final class AudioCapture: @unchecked Sendable {
     }
 
     // MARK: - Device
+
+    /// How long a caller will wait for the device lock before giving up.
+    ///
+    /// The lock is held across `engine.start()`, and a device that has just been
+    /// pulled out from under CoreAudio can make that take seconds. Everything
+    /// that takes this lock is on the main thread — a press, the menu opening, a
+    /// preference changing — so waiting without a limit is not a slow
+    /// microphone, it is an app that has stopped answering, and with the
+    /// finalize tap installed it is a keyboard that has stopped working in every
+    /// application. A refused press is recoverable by pressing again. A wedged
+    /// main thread is recoverable only by force-quitting.
+    private static let lockTimeout: TimeInterval = 0.5
+
+    /// **Test-only.** Holds the device lock on another thread for `seconds`,
+    /// which is exactly what a configuration change in progress looks like to a
+    /// press arriving on the main thread.
+    ///
+    /// The condition this reproduces cannot be produced on demand any other way:
+    /// it needs CoreAudio to be part-way through tearing a real device down, and
+    /// the only recipe anyone has for that is to physically disconnect a
+    /// Bluetooth headset. Same reasoning as `WhisperEngine.forcedSampleLength` —
+    /// manufacture the state rather than wait for the hardware.
+    public func holdDeviceLockForTesting(seconds: TimeInterval) {
+        let thread = Thread { [lock] in
+            lock.lock()
+            Thread.sleep(forTimeInterval: seconds)
+            lock.unlock()
+        }
+        thread.start()
+        // The caller's next line is the thing under test, so the lock has to be
+        // held by the time it runs.
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+
+    /// Takes `lock`, or gives up rather than blocking the caller forever.
+    private func acquireLock(for what: String) throws {
+        guard lock.lock(before: Date().addingTimeInterval(Self.lockTimeout)) else {
+            diagnosticLog?(
+                "audio device busy, \(what) refused: the device lock is still held, "
+                    + "most likely by a configuration change in progress")
+            throw CaptureError.deviceBusy
+        }
+    }
+
+    /// `acquireLock` for the callers that have no way to report a failure.
+    private func acquireLockOrSkip(for what: String) -> Bool {
+        guard lock.lock(before: Date().addingTimeInterval(Self.lockTimeout)) else {
+            diagnosticLog?("audio device busy, \(what) skipped: the device lock is still held")
+            return false
+        }
+        return true
+    }
 
     private func startLocked() throws {
         // The engine is the authority on whether it is running. It stops
@@ -357,7 +475,17 @@ public final class AudioCapture: @unchecked Sendable {
         // which is the clipped first syllable coming back by another route.
         if !tapInstalled { installTapLocked() }
         guard !isRunning else { return }
+        // Timed because this is the call that hangs. Ordinary opens cost
+        // 15-472 ms (`--testmic`); a device that CoreAudio is still tearing down
+        // — a Bluetooth headset just disconnected — can make it take seconds,
+        // and it is invisible from the outside because nothing else is logged
+        // between the press and the audio. A slow open now names itself.
+        let began = ContinuousClock.now
         try engine.start()
+        let took = (ContinuousClock.now - began) / .milliseconds(1)
+        if took >= 250 {
+            diagnosticLog?(String(format: "opening the input device took %.0f ms", took))
+        }
         isRunning = true
     }
 
@@ -562,6 +690,13 @@ public final class AudioCapture: @unchecked Sendable {
             // 0.82 was, which is what keeps the meter from jittering now that
             // it is sampled four times as finely.
             level = measured > level ? measured : level * 0.82 + measured * 0.18
+            // The measurement, not the decayed meter value: the decay exists so
+            // the bars do not flicker between words, and counting it here would
+            // credit the gaps to the speech either side of them.
+            if capturing, measured >= Self.speechLevel {
+                speechSecondsMeasured +=
+                    buffer.format.sampleRate > 0 ? Double(count) / buffer.format.sampleRate : 0
+            }
             levelSamples.append(
                 LevelSample(
                     level: level,

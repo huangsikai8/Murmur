@@ -11,6 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.startSession()
         Log.write("applicationDidFinishLaunching")
+        // Started before anything that can stall, which on a cold launch is the
+        // speech model load — measured at 4599 ms on the run that prompted this.
+        MainThreadWatchdog.shared.start()
         menuBar = MenuBarController(controller: controller, hotkeyMonitor: hotkeyMonitor)
         // Restore saved choices before the first dictation can happen.
         menuBar?.applyPreferences()

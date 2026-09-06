@@ -48,6 +48,28 @@ if CommandLine.arguments.contains("--testfocus") {
     })
 }
 
+// `--testpaste [iterations]` measures the other end of an insertion: how long
+// the application in front takes to read the pasteboard after the ⌘V lands.
+// That is the number the clipboard restore used to guess at.
+if let index = CommandLine.arguments.firstIndex(of: "--testpaste") {
+    let iterations =
+        CommandLine.arguments.count > index + 1
+        ? Int(CommandLine.arguments[index + 1]) ?? 3 : 3
+    exit(runBlocking { await PasteTest.run(iterations: iterations) })
+}
+
+// `--teststall [seconds]` blocks the main thread on purpose and asserts the
+// keyboard survives it. The app holds an active event tap on the main run loop,
+// so a stalled main thread is a keyboard that has stopped working in every
+// application — the one failure that leaves no log line and no crash report.
+// Runs synchronously: the point is a main thread that is not available.
+if let index = CommandLine.arguments.firstIndex(of: "--teststall") {
+    let seconds =
+        CommandLine.arguments.count > index + 1
+        ? Double(CommandLine.arguments[index + 1]) ?? 2.0 : 2.0
+    exit(StallTest.run(stallSeconds: seconds))
+}
+
 // `--testmic [iterations]` measures the speech lost before the microphone is
 // running — the one gap at the start of an utterance that nothing buffers.
 if let index = CommandLine.arguments.firstIndex(of: "--testmic") {

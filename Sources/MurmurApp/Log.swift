@@ -39,9 +39,23 @@ enum Log {
         }
     }
 
-    /// Starts a fresh file each launch so the log reflects the current run.
+    /// The run before this one, kept so a launch cannot destroy the evidence.
+    static let previousFileURL: URL = FileManager.default
+        .homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Murmur.log.1")
+
+    /// Starts a fresh file each launch so the log reflects the current run, and
+    /// moves the previous run aside rather than deleting it.
+    ///
+    /// A hang leaves nothing behind: the app writes no line saying it stopped
+    /// answering, so the only record of one is whatever it had logged up to that
+    /// point — and the very next thing anybody does with a hung menu bar app is
+    /// force-quit it and start it again, which used to `removeItem` that record
+    /// before it could be read. One generation is enough, because the run that
+    /// matters is always the one immediately before the relaunch.
     static func startSession() {
-        try? FileManager.default.removeItem(at: fileURL)
+        try? FileManager.default.removeItem(at: previousFileURL)
+        try? FileManager.default.moveItem(at: fileURL, to: previousFileURL)
         write("=== Murmur \(Bundle.main.bundleIdentifier ?? "?") starting ===")
     }
 }

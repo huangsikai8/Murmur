@@ -82,11 +82,17 @@ final class FinalizeKeyMonitor {
         CGEvent.tapEnable(tap: created, enable: true)
         tap = created
         source = loopSource
+        // Handed to the gate so a watchdog on another thread can switch it off.
+        // This tap sits on the main run loop, so a stalled main thread is a
+        // keyboard that has stopped working everywhere, and nothing running on
+        // the main thread can rescue that.
+        KeyboardTapGate.shared.adopt(created)
         return true
     }
 
     func stop() {
         guard let tap else { return }
+        KeyboardTapGate.shared.adopt(nil)
         CGEvent.tapEnable(tap: tap, enable: false)
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         CFMachPortInvalidate(tap)
@@ -99,6 +105,7 @@ final class FinalizeKeyMonitor {
         // down directly here. Leaving it installed would keep swallowing keys
         // for a monitor nothing owns any more.
         if let tap {
+            KeyboardTapGate.shared.adopt(nil)
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
         }
@@ -111,9 +118,18 @@ final class FinalizeKeyMonitor {
         // The system disables a tap that takes too long, and a disabled tap
         // fails silently — the key simply stops working. Re-enabling is the
         // documented recovery.
+        //
+        // But not while the watchdog is holding the keyboard open. From inside
+        // this callback the two look identical — the tap is off either way —
+        // and only one of them is safe to undo here: re-enabling a tap the
+        // watchdog switched off because the main thread had stopped answering
+        // hands every keystroke on the machine straight back to a thread that
+        // is still stuck. The watchdog resumes it when the main thread replies.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            MainActor.assumeIsolated {
-                if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            if !KeyboardTapGate.shared.isSuspended {
+                MainActor.assumeIsolated {
+                    if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                }
             }
             return Unmanaged.passUnretained(event)
         }

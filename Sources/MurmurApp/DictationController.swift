@@ -125,11 +125,11 @@ final class DictationController {
     /// This gates the **overlay only**. Audio is still captured, still fed to
     /// the recognizer, and still transcribed and inserted; nothing about
     /// detection changes.
-    /// Roughly -33 dBFS on `AudioCapture`'s curve, which is quiet speech.
-    /// Recalibrated with that curve rather than left alone: the same number
-    /// means a different loudness every time the curve moves, and the failure
-    /// it guards against — the card appearing for room noise — is silent.
-    private static let overlaySpeechLevel: Float = 0.2
+    /// Roughly -33 dBFS on `AudioCapture`'s curve, which is quiet speech. Taken
+    /// from `AudioCapture` rather than written out again: the same number means
+    /// a different loudness every time that curve moves, and the failure it
+    /// guards against — the card appearing for room noise — is silent.
+    private static let overlaySpeechLevel: Float = AudioCapture.speechLevel
     private var lastSpeechAt = ContinuousClock.now
     private var idleTask: Task<Void, Never>?
     private var escapeMonitor: Any?
@@ -517,24 +517,72 @@ final class DictationController {
     /// the whole utterance after it is silent.
     private var sessionToken: UInt64 = 0
 
-    /// Longest a latched session may run with nothing stopping it. A held key
-    /// cannot be forgotten; a latch can, and an open microphone that never
-    /// finalizes is the same class of failure as an unbounded cleanup pass.
-    var maximumLatchDuration: Duration = .seconds(120)
+    /// How long a latch may go **without speech** before it finalizes itself.
+    ///
+    /// A held key cannot be forgotten; a latch can, and a microphone left open
+    /// for the rest of the afternoon is the failure this guards. But the thing
+    /// worth ending is a *forgotten* latch, and elapsed time cannot tell one of
+    /// those from somebody who simply had a lot to say — so it used to end both,
+    /// at a flat two minutes, mid-sentence and with no warning.
+    ///
+    /// Silence tells them apart, and the app already measures it:
+    /// `AudioCapture.speechSeconds` counts only slices loud enough to be a
+    /// voice, so a forgotten latch stops advancing it and a long dictation does
+    /// not. Ninety seconds is far longer than anyone pauses mid-thought.
+    var latchSilenceTimeout: Duration = .seconds(90)
+
+    /// Absolute ceiling on a latch, whatever is being said into it.
+    ///
+    /// Kept, because the cost of a very long hold is real and lands all at once
+    /// when the key finally comes up: decode time scales with the audio — 55 s
+    /// took 3.6 s on Whisper Small, so half an hour is roughly two minutes of
+    /// staring at nothing — and the samples are resident until then.
+    var maximumLatchDuration: Duration = .seconds(900)
+
+    /// How often the latch is checked. The timeouts are minutes, so this only
+    /// has to be small enough that the end does not feel arbitrary.
+    private static let latchWatchInterval: Duration = .seconds(5)
+
     private var latchWatch: Task<Void, Never>?
 
-    /// Finalizes rather than discards at the cap: if the speaker really did
+    /// Finalizes rather than discards at either limit: if the speaker really did
     /// talk that long the words are theirs, and throwing them away is the one
     /// outcome that cannot be undone.
     private func startLatchWatch() {
         latchWatch?.cancel()
-        guard isLatched, maximumLatchDuration > .zero else { return }
+        guard isLatched else { return }
+        guard latchSilenceTimeout > .zero || maximumLatchDuration > .zero else { return }
+        let began = ContinuousClock.now
         latchWatch = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: self.maximumLatchDuration)
-            guard !Task.isCancelled, self.isActive else { return }
-            Log.write("latch reached \(self.maximumLatchDuration), finalizing")
-            self.end()
+            var lastSpoke = ContinuousClock.now
+            var spokenAtLastCheck: Double = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.latchWatchInterval)
+                guard let self, !Task.isCancelled, self.isActive, self.isLatched else { return }
+
+                // Only counts audio loud enough to have been a voice, so a room
+                // with a fan in it does not hold a forgotten latch open.
+                let spoken = self.capture.speechSeconds
+                if spoken > spokenAtLastCheck {
+                    spokenAtLastCheck = spoken
+                    lastSpoke = ContinuousClock.now
+                }
+
+                let quiet = ContinuousClock.now - lastSpoke
+                if self.latchSilenceTimeout > .zero, quiet >= self.latchSilenceTimeout {
+                    Log.write(
+                        "latch heard no speech for \(self.latchSilenceTimeout), finalizing")
+                    self.end()
+                    return
+                }
+
+                let running = ContinuousClock.now - began
+                if self.maximumLatchDuration > .zero, running >= self.maximumLatchDuration {
+                    Log.write("latch reached \(self.maximumLatchDuration), finalizing")
+                    self.end()
+                    return
+                }
+            }
         }
     }
 
@@ -1102,12 +1150,48 @@ final class DictationController {
     }
 
     /// Briefly shows a message on the card, then hides it.
-    private func announce(_ state: OverlayModel.State) {
+    /// A hold that produced no text at all.
+    ///
+    /// Silence and a failed recognition are the same event from here — the
+    /// transcript is empty either way — and the card used to simply disappear
+    /// for both. That is right for a key tapped by accident and wrong for six
+    /// seconds of speech: nothing appears, nothing is said, and the only
+    /// evidence the words ever existed is a log file. Measured on a real
+    /// session, three holds in one minute came back empty at -25 dBFS while a
+    /// fourth at the same level transcribed normally.
+    ///
+    /// `AudioCapture.speechSeconds` is what separates the two, and it is the
+    /// question a peak cannot answer: a peak is the loudest 25 ms of the hold,
+    /// so one door closing reads exactly like somebody talking.
+    private func reportUnrecognizedHold() {
+        let spoken = capture.speechSeconds
+        guard spoken >= Self.unrecognizedSpeechSeconds else {
+            overlay.hide()
+            return
+        }
+        Log.write(
+            String(
+                format: "hold produced no text with %.1f s of speech-level audio in it",
+                spoken))
+        // Held longer than the other announcements, for the same reason the
+        // clipboard fallback is: nothing arrived in the target application, so
+        // this card is the only evidence there was anything to arrive.
+        announce(
+            .error("Nothing recognized — those words were not inserted"), for: .seconds(2))
+    }
+
+    /// Speech in a hold that produced nothing, before it is worth saying so.
+    /// Below this it is a key tapped by accident, a cough, or a syllable, and a
+    /// card in the corner is noise rather than news.
+    private static let unrecognizedSpeechSeconds: Double = 0.8
+
+    private func announce(_ state: OverlayModel.State, for duration: Duration = .milliseconds(1400))
+    {
         overlayVisible = true
         overlay.show()
         overlay.setState(state)
         Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(1400))
+            try? await Task.sleep(for: duration)
             self?.hideOverlay()
         }
     }
@@ -1260,7 +1344,7 @@ final class DictationController {
         latency.mark(.finalTranscript)
 
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            overlay.hide()
+            reportUnrecognizedHold()
             latency.report()
             return
         }

@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import Carbon.HIToolbox
 import Foundation
 import MurmurCore
 
@@ -311,6 +312,137 @@ await runner.test("a focused field reports pasted and restores the clipboard") {
 
     try await Task.sleep(for: .milliseconds(400))
     runner.expectEqual(pasteboard.string(forType: .string), "original")
+}
+
+// The bug this covers: a hold pasted the *previous* transcript instead of the
+// one just spoken. Two paths here deliberately leave the words on the clipboard
+// and never restore, so the value sitting there when the next dictation starts
+// is often the last transcript — which the next insertion then snapshots as
+// "the user's clipboard" and hands back 0.35 s later, in the middle of a paste
+// an application had not read yet.
+await runner.test("a transcript this inserter left behind is never restored") {
+    let pasteboard = NSPasteboard(name: .init("murmur.test.ourown"))
+    pasteboard.clearContents()
+
+    // One inserter across both utterances, as the app has.
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {},
+        canReceiveText: { _ in .unknown }, watchPaste: { _ in nil })
+    // Focus could not be read, so this one stays on the clipboard by design.
+    runner.expectEqual(try inserter.insert("the first utterance"), .pastedUnverified)
+
+    let second = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {},
+        canReceiveText: { _ in .acceptsText }, watchPaste: { _ in nil })
+    _ = try second.insert("the second utterance")
+
+    try await Task.sleep(for: .milliseconds(400))
+    runner.expectEqual(pasteboard.string(forType: .string), "the second utterance")
+}
+
+// The same, through one inserter, which is the shape the app actually runs in.
+await runner.test("consecutive utterances never put an older one back") {
+    let pasteboard = NSPasteboard(name: .init("murmur.test.consecutive"))
+    pasteboard.clearContents()
+    pasteboard.setString("user's original clipboard", forType: .string)
+
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.05, paste: {},
+        canReceiveText: { _ in .acceptsText }, watchPaste: { _ in nil })
+    _ = try inserter.insert("first")
+    try await Task.sleep(for: .milliseconds(300))
+    runner.expectEqual(pasteboard.string(forType: .string), "user's original clipboard")
+
+    // Now the restore is prevented, as a clipboard manager or a copy made
+    // during the window would prevent it, leaving the transcript in place.
+    let held = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 5.0, paste: {},
+        canReceiveText: { _ in .acceptsText }, watchPaste: { _ in nil })
+    _ = try held.insert("second")
+
+    _ = try inserter.insert("third")
+    try await Task.sleep(for: .milliseconds(400))
+    runner.expect(
+        pasteboard.string(forType: .string) != "second",
+        "an earlier transcript was put back over a later one")
+}
+
+// Restoring on a timer is a guess about another process's schedule, and the
+// guess is wrong exactly where it matters: Chromium reads the pasteboard
+// asynchronously, so a busy renderer reads it after the restore.
+await runner.test("the clipboard is put back as soon as the paste is seen to land") {
+    let pasteboard = NSPasteboard(name: .init("murmur.test.confirmed"))
+    pasteboard.clearContents()
+    pasteboard.setString("original", forType: .string)
+
+    let landed = Flag()
+    let inserter = ClipboardPasteInserter(
+        // A ceiling far beyond the confirmation, so a restore inside it can
+        // only have come from the paste being seen.
+        pasteboard: pasteboard, restoreDelay: 5.0, paste: {},
+        canReceiveText: { _ in .acceptsText },
+        watchPaste: { _ in { landed.value } })
+    _ = try inserter.insert("landed text")
+
+    try await Task.sleep(for: .milliseconds(150))
+    runner.expectEqual(
+        pasteboard.string(forType: .string), "landed text", "restored before the paste landed")
+
+    landed.value = true
+    try await Task.sleep(for: .milliseconds(300))
+    runner.expectEqual(pasteboard.string(forType: .string), "original")
+}
+
+// A watcher that never says yes must not hold the clipboard for ever.
+await runner.test("an unconfirmed paste still restores at the ceiling") {
+    let pasteboard = NSPasteboard(name: .init("murmur.test.ceiling"))
+    pasteboard.clearContents()
+    pasteboard.setString("original", forType: .string)
+
+    let inserter = ClipboardPasteInserter(
+        pasteboard: pasteboard, restoreDelay: 0.2, paste: {},
+        canReceiveText: { _ in .acceptsText },
+        watchPaste: { _ in { false } })
+    _ = try inserter.insert("never confirmed")
+
+    try await Task.sleep(for: .milliseconds(700))
+    runner.expectEqual(pasteboard.string(forType: .string), "original")
+}
+
+runner.suite("Shortcuts")
+
+await runner.test("a recorded chord draws itself the way macOS does") {
+    let chord = KeyChord(
+        keyCode: 2, carbonModifiers: UInt32(controlKey | optionKey | shiftKey | cmdKey),
+        keyLabel: "D")
+    runner.expectEqual(chord.displayName, "⌃⌥⇧⌘D")
+}
+
+await runner.test("a chord survives being stored and read back") {
+    let chord = KeyChord(
+        keyCode: 49, carbonModifiers: UInt32(controlKey | optionKey), keyLabel: "Space")
+    let data = try JSONEncoder().encode(chord)
+    let decoded = try JSONDecoder().decode(KeyChord.self, from: data)
+    runner.expectEqual(decoded, chord)
+    runner.expectEqual(decoded.displayName, "⌃⌥Space")
+}
+
+// A global hotkey on a bare key claims that key in every application for as
+// long as Murmur runs, and ⇧D is a capital D.
+await runner.test("a key press without ⌘⌥⌃ is not a shortcut") {
+    runner.expect(KeyChord(event: keyPress("d", modifiers: [])) == nil, "bare D was accepted")
+    runner.expect(KeyChord(event: keyPress("D", modifiers: [.shift])) == nil, "⇧D was accepted")
+    runner.expect(
+        KeyChord(event: keyPress("d", modifiers: [.command, .option])) != nil,
+        "⌥⌘D was refused")
+}
+
+await runner.test("a recorded key is named, not left blank") {
+    let recorded = KeyChord(event: keyPress("d", modifiers: [.control, .option]))
+    runner.expectEqual(recorded?.displayName, "⌃⌥D")
+    // Return prints "\r", which would be drawn as nothing at all.
+    let returnKey = KeyChord(event: keyPress("\r", modifiers: [.command], keyCode: 36))
+    runner.expectEqual(returnKey?.displayName, "⌘↩")
 }
 
 runner.suite("Voice commands")
@@ -809,6 +941,32 @@ await runner.test("silence produces no bands at all") {
     runner.expectEqual(bands.allSatisfy { $0 == 0 }, true, "silence moved the meter: \(bands)")
 }
 
+// MARK: - What counts as somebody speaking
+
+runner.suite("Speech level")
+
+// `AudioCapture.speechLevel` is one number on a curve that has moved twice, and
+// everything calibrated against it fails silently when it moves again: the card
+// appears for room noise, or a hold that lost six seconds of speech is written
+// off as a quiet room. These are the two ends it has to keep apart.
+await runner.test("ordinary speech is above the speech level") {
+    for decibels in [Float(-33), -25, -20, -15] {
+        let level = AudioCapture.loudness(ofRMS: pow(10, decibels / 20))
+        runner.expect(
+            level >= AudioCapture.speechLevel,
+            "\(decibels) dBFS gave \(level), below the \(AudioCapture.speechLevel) speech level")
+    }
+}
+
+await runner.test("a quiet room is below the speech level") {
+    for decibels in [Float(-50), -45, -42, -40] {
+        let level = AudioCapture.loudness(ofRMS: pow(10, decibels / 20))
+        runner.expect(
+            level < AudioCapture.speechLevel,
+            "\(decibels) dBFS gave \(level), at or above the speech level")
+    }
+}
+
 // MARK: - Whisper invents words on silence
 
 runner.suite("Whisper silence guard")
@@ -876,6 +1034,56 @@ await runner.test("the decoder is asked for timestamps") {
     runner.expectEqual(WhisperEngine.decodesWithTimestamps, true)
 }
 
+// Timestamps are not the whole answer, because the decoder can stop before the
+// audio runs out for reasons of its own. WhisperKit's seek loop then does
+// `seek += segmentSize` and skips a window; under 30 s that window is the whole
+// recording, so the hold ends there. Measured on a real 20.4-second latched
+// hold: 39 words, cut mid-clause. `WhisperEngine` re-decodes whatever audible
+// audio the transcript never accounted for, and the second arm of `--testlong`
+// is what exercises that — capping the sample length produces the same early
+// stop deliberately, and without the recovery it loses a whole sentence.
+//
+// A gap is re-decoded from the last timestamp the decoder emitted, which is
+// where the model stopped rather than where the phrase did, so the two decodes
+// can overlap by a few words at that seam.
+await runner.test("a repeated phrase at a recovery seam is removed once") {
+    runner.expectEqual(
+        WhisperEngine.trimmingOverlap(
+            "The barometer in the hallway has been reading far too low.",
+            following: "on the way home this evening. The barometer in the"),
+        "hallway has been reading far too low.")
+}
+
+await runner.test("an overlap is matched on words, not on punctuation or case") {
+    runner.expectEqual(
+        WhisperEngine.trimmingOverlap(
+            "in the hallway, has been reading.", following: "The barometer In The"),
+        "hallway, has been reading.")
+}
+
+// One repeated word is something people say, and a seam is not evidence enough
+// to take it away from them.
+await runner.test("a single repeated word at a seam is kept") {
+    runner.expectEqual(
+        WhisperEngine.trimmingOverlap("really cold outside.", following: "it was really"),
+        "really cold outside.")
+}
+
+await runner.test("text that does not repeat the seam is untouched") {
+    let text = "and then I went home."
+    runner.expectEqual(WhisperEngine.trimmingOverlap(text, following: "we talked for a while."), text)
+    runner.expectEqual(WhisperEngine.trimmingOverlap(text, following: ""), text)
+}
+
+// The ceiling matters: an overlap long enough to be a sentence is a decode that
+// went wrong, not a phrase repeated at a seam, and trimming it would delete
+// speech rather than a duplicate.
+await runner.test("an overlap cannot swallow more than a phrase") {
+    let words = (1...20).map { "word\($0)" }
+    let text = words.joined(separator: " ")
+    runner.expectEqual(WhisperEngine.trimmingOverlap(text, following: text).isEmpty, false)
+}
+
 // The price of the line above: with timestamps on the model also emits its
 // captioning annotations, as ordinary text that `skipSpecialTokens` never sees.
 await runner.test("non-speech annotations are removed") {
@@ -908,6 +1116,45 @@ await runner.test("bracketed text the speaker dictated is kept") {
         "Call foo(bar) when ready.",
         "See the note (the one from Tuesday) below.",
         "A stray [ bracket that never closes",
+    ] {
+        runner.expectEqual(WhisperEngine.stripNonSpeechAnnotations(kept), kept)
+    }
+}
+
+// Whisper composes captions on the spot as well as spelling stock ones, so a
+// fixed list of phrases cannot be the whole test. These three arrived in one
+// real sentence: "… use the volatility surface too? (Audience chattering)
+// (people chattering) (people chattering)".
+await runner.test("captions the model composed are removed too") {
+    for annotation in [
+        "(Audience chattering)", "(people chattering)", "(crowd murmuring)",
+        "(indistinct chatter)", "(faint music playing)", "(soft laughter)",
+        "(background noise)", "(clears throat)", "(no audio)",
+    ] {
+        runner.expectEqual(
+            WhisperEngine.stripNonSpeechAnnotations("Hello there. " + annotation)
+                .trimmingCharacters(in: .whitespaces),
+            "Hello there.", "\(annotation) survived")
+    }
+}
+
+await runner.test("a run of captions leaves one clean sentence") {
+    runner.expectEqual(
+        TextNormalizer.finalize(
+            WhisperEngine.stripNonSpeechAnnotations(
+                "And so how do you want to use the volatility surface too? "
+                    + "(Audience chattering) (people chattering) (people chattering)")),
+        "And so how do you want to use the volatility surface too?")
+}
+
+// The vocabulary is unanimous on purpose: one word it does not know keeps the
+// span, because these are words the app deletes without saying so.
+await runner.test("bracketed prose containing a caption word is kept") {
+    for kept in [
+        "The report (the music of Tuesday) is late.",
+        "Revenue (and the noise around it) rose.",
+        "See the appendix (a distant memory now, honestly, but there) below.",
+        "Call it (bar) for now.",
     ] {
         runner.expectEqual(WhisperEngine.stripNonSpeechAnnotations(kept), kept)
     }
@@ -2089,6 +2336,90 @@ await runner.test("an observer may read the history from the notification") {
 // dictation in that state records silence: nothing reinstalls the tap and
 // nothing starts the engine. The real device is exercised by `--testmic`.
 
+runner.suite("Failed-gap subdivision")
+
+// A gap re-decoded whole is the same question the decoder already refused. The
+// real hold this comes from returned nothing for 0.2-30.0 s, was handed the
+// same 29.8 seconds back, refused it again, and lost half the transcript.
+await runner.test("a whole-window gap is cut into pieces the decoder has not refused") {
+    let plan = WhisperEngine.subdivisionPlan(from: 0.2, to: 30.0)
+    runner.expect(plan.count >= 2, "a 29.8 s gap produced \(plan.count) piece(s)")
+    for piece in plan {
+        runner.expect(
+            piece.to - piece.from < 30,
+            "a piece of \(piece.to - piece.from) s is still a whole window")
+    }
+}
+
+// A plan that leaves a hole re-creates the defect it exists to fix, and the
+// transcript reads perfectly well straight across one.
+await runner.test("the pieces cover the whole gap") {
+    for (start, end) in [(0.2, 30.0), (0.0, 46.7), (5.0, 21.0), (0.0, 15.5)] {
+        let plan = WhisperEngine.subdivisionPlan(from: start, to: end)
+        guard let first = plan.first, let last = plan.last else {
+            runner.expect(false, "\(start)-\(end) s produced no pieces at all")
+            continue
+        }
+        runner.expect(first.from <= start + 0.001, "the first piece starts after the gap does")
+        runner.expectEqual(last.to, end, "the last piece stops short of the gap")
+        for (previous, next) in zip(plan, plan.dropFirst()) {
+            runner.expect(
+                next.from <= previous.to,
+                "a hole opened between \(previous.to) s and \(next.from) s")
+        }
+    }
+}
+
+// A word spoken across a cut has to be whole in one of the pieces.
+await runner.test("consecutive pieces overlap rather than butting together") {
+    let plan = WhisperEngine.subdivisionPlan(from: 0, to: 40)
+    runner.expect(plan.count >= 3, "expected several pieces, got \(plan.count)")
+    for (previous, next) in zip(plan, plan.dropFirst()) {
+        runner.expect(
+            next.from < previous.to,
+            "pieces meet exactly at \(previous.to) s, so a word across the cut is lost")
+    }
+}
+
+// The loop advances by the piece length, and a remainder too short to hold a
+// word is dropped rather than decoded — silence is what Whisper answers with
+// words nobody said.
+await runner.test("the plan terminates and never returns a sliver") {
+    for end in stride(from: 1.0, through: 60.0, by: 0.7) {
+        let plan = WhisperEngine.subdivisionPlan(from: 0, to: end)
+        runner.expect(plan.count < 200, "\(end) s produced \(plan.count) pieces — runaway")
+        for piece in plan {
+            runner.expect(
+                piece.to - piece.from >= 1.0,
+                "a \(piece.to - piece.from) s sliver was scheduled for a decode")
+        }
+    }
+}
+
+runner.suite("Long-hold recovery budget")
+
+// Every 30-second window is its own chance to come back blank, so a budget
+// sized for a one-minute hold runs out part-way through a five-minute one and
+// abandons the rest of the recording without saying so.
+await runner.test("the recovery budget grows with the recording") {
+    let short = WhisperEngine.recoveryPassBudget(forSeconds: 55)
+    let long = WhisperEngine.recoveryPassBudget(forSeconds: 300)
+    runner.expectEqual(short, 8, "a short hold keeps the budget it always had")
+    runner.expect(
+        long > short,
+        "a 5-minute hold got \(long) passes, no more than a 55-second one")
+    runner.expect(
+        long >= 14, "a 5-minute hold crosses 10 windows and got only \(long) passes")
+}
+
+await runner.test("the budget never drops below the original eight") {
+    for seconds in [0.0, 1.0, 30.0, 120.0] {
+        runner.expect(
+            WhisperEngine.recoveryPassBudget(forSeconds: seconds) >= 8,
+            "\(seconds) s got fewer than 8 passes")
+    }
+}
+
 runner.suite("Microphone arming")
 
 await runner.test("a capture that was never armed reports itself closed") {
@@ -2101,6 +2432,46 @@ await runner.test("stop leaves it closed and safe to repeat") {
     capture.stop()
     capture.stop()
     runner.expect(!capture.isArmed, "stopping an unopened device must not claim it is open")
+}
+
+// A press arriving while the audio device is being switched must be refused,
+// not queued behind the switch.
+//
+// This is the failure that froze a whole machine. `lock` is held across
+// `engine.start()`, a Bluetooth headset disconnecting makes that take seconds,
+// and every caller here is on the main thread — so an unbounded wait is not a
+// slow microphone, it is an app that has stopped answering, and the finalize
+// tap sits on the main run loop, so it is a keyboard that has stopped working
+// in every application at once.
+await runner.test("a press during a device change is refused rather than blocking") {
+    let capture = AudioCapture()
+    capture.holdDeviceLockForTesting(seconds: 3)
+
+    let began = ContinuousClock.now
+    var refused = false
+    do {
+        try capture.arm()
+    } catch AudioCapture.CaptureError.deviceBusy {
+        refused = true
+    } catch {
+        // Any other error is fine here: it means the lock was taken and the
+        // engine answered, which is not what this test is about.
+    }
+    let waited = (ContinuousClock.now - began) / .milliseconds(1)
+
+    runner.expect(refused, "arming during a held device lock must fail with deviceBusy")
+    runner.expect(
+        waited < 1500,
+        "arming waited \(Int(waited)) ms — a press must give up long before the lock does")
+}
+
+await runner.test("the device lock is available again once the change finishes") {
+    let capture = AudioCapture()
+    capture.holdDeviceLockForTesting(seconds: 0.2)
+    // Long enough for the holder to let go; the point is that the timeout does
+    // not leave the lock permanently poisoned.
+    try? await Task.sleep(for: .milliseconds(400))
+    runner.expect(!capture.isArmed, "a released lock must be readable again")
 }
 
 exit(runner.finish())

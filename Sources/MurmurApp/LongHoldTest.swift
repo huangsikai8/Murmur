@@ -24,7 +24,7 @@ enum LongHoldTest {
     /// in the middle of the recording rather than at either end.
     private static let sentences: [(marker: String, text: String)] = [
         ("pineapple", "The first thing I want to record is that the pineapple was left on the counter overnight."),
-        ("harbour", "Somebody should tell the office that the harbour road is closed again this morning."),
+        ("ferry", "Somebody should tell the office that the ferry crossing is closed again this morning."),
         ("artichoke", "Remind me to buy an artichoke and two lemons on the way home this evening."),
         ("barometer", "The barometer in the hallway has been reading far too low since the weekend."),
         ("telescope", "I promised to return the telescope before the end of the month, and I have not."),
@@ -35,6 +35,11 @@ enum LongHoldTest {
 
     /// Silence between sentences, the length of an ordinary pause for thought.
     private static let pauseSeconds: Double = 2.5
+
+    /// Tokens one decode may sample in the second arm. Short enough that no
+    /// single decode can reach the end of the fixture, so the transcript can
+    /// only be complete if the engine noticed and carried on.
+    private static let forcedSampleLength = 64
 
     static func run(modelID: String?) async -> Int32 {
         ModelCatalog.coreMLEngineWired = true
@@ -73,18 +78,51 @@ enum LongHoldTest {
         print(String(format: "Fixture: %.1f s, crossing %d window boundary(s)\n", seconds, Int(seconds / 30)))
 
         var failures = 0
+        var clean: [String: Int] = [:]
         for model in models {
-            failures += await measure(modelID: model, audio: audio, seconds: seconds)
+            let result = await measure(modelID: model, audio: audio, seconds: seconds)
+            failures += result.failed ? 1 : 0
+            clean[model] = result.words
         }
+
+        // The same hold with the decoder forced to stop before the audio runs
+        // out. Whisper does this on its own with real speech — a hold measured
+        // at 20.4 s came back cut mid-clause, and nothing synthesized here has
+        // ever reproduced it — so the condition is produced deliberately rather
+        // than waited for. WhisperKit's seek loop has no answer to it: where the
+        // decoder emits no usable timestamp it skips a whole window, which for a
+        // hold under 30 s is the entire recording. `WhisperEngine` re-decodes
+        // whatever audible audio the transcript never accounted for, and this
+        // arm is what says so: without that recovery Base returns 93 of its 124
+        // words and reads perfectly well straight across the hole.
+        //
+        // Judged on how much of the hold survives rather than on the marker
+        // words, because a cap this short chops the decode mid-word and can
+        // genuinely destroy one — measured, "cardigan" survives one run and
+        // comes back as two words the next. What the recovery is responsible for
+        // is the *span*, and 75% against 92-101% separates the two cleanly.
+        print("\nThe same hold with the decoder forced to stop early")
+        print("(sampleLength \(forcedSampleLength)), which is what real speech does by accident.")
+        print("Each model must keep \(Int(survivalFloor * 100))% of the words its own clean run gave.\n")
+        WhisperEngine.forcedSampleLength = forcedSampleLength
+        for model in models {
+            let result = await measure(
+                modelID: model, audio: audio, seconds: seconds, mustKeepWordsOf: clean[model])
+            failures += result.failed ? 1 : 0
+        }
+        WhisperEngine.forcedSampleLength = nil
 
         print("")
         if failures == 0 {
-            print("Every sentence survived the hold.")
+            print("Every sentence survived both holds.")
             return 0
         }
         print("\(failures) model(s) dropped speech across the window boundary.")
         return 1
     }
+
+    /// Share of the clean run's words the forced-stop run has to keep.
+    private static let survivalFloor = 0.9
 
     private static func installedWhisperIDs() -> [String] {
         WhisperEngine.Variant.allCases
@@ -92,11 +130,16 @@ enum LongHoldTest {
             .map(\.modelID)
     }
 
-    private static func measure(modelID: String, audio: Samples, seconds: Double) async -> Int {
+    /// Runs the hold once. `mustKeepWordsOf` is the clean run's word count, and
+    /// passing it switches the verdict from "every marker survived" to "the span
+    /// survived" — the forced-stop arm's question.
+    private static func measure(
+        modelID: String, audio: Samples, seconds: Double, mustKeepWordsOf clean: Int? = nil
+    ) async -> (failed: Bool, words: Int) {
         let name = ModelCatalog.model(id: modelID)?.name ?? modelID
         guard let engine = SpeechEngineFactory.engine(for: modelID) else {
             print("  ✗ \(name): no engine implements \(modelID)")
-            return 1
+            return (true, 0)
         }
         defer { Task { await engine.releaseModels() } }
 
@@ -108,7 +151,7 @@ enum LongHoldTest {
             text = try await transcribe(audio, engine: engine, format: format)
         } catch {
             print("  ✗ \(name): \(error.localizedDescription)")
-            return 1
+            return (true, 0)
         }
         let elapsed = SpeechFixture.milliseconds(since: started)
 
@@ -118,11 +161,21 @@ enum LongHoldTest {
         // A bracketed annotation reaching this point is text nobody spoke.
         let annotated = text != WhisperEngine.stripNonSpeechAnnotations(text)
 
-        print("  \(missing.isEmpty && !annotated ? "✓" : "✗") \(name)")
+        let kept = clean.map { $0 > 0 ? Double(words) / Double($0) : 1 }
+        let failed =
+            annotated || (kept.map { $0 < survivalFloor } ?? !missing.isEmpty)
+
+        print("  \(failed ? "✗" : "✓") \(name)")
         print(
             String(
                 format: "      %d words in %d ms (%.2f words/s over a %.1f s hold)", words, elapsed,
                 seconds > 0 ? Double(words) / seconds : 0, seconds))
+        if let kept, let clean {
+            print(
+                String(
+                    format: "      kept %.0f%% of the %d words the clean run gave", kept * 100,
+                    clean))
+        }
         if missing.isEmpty {
             print("      all \(sentences.count) markers present")
         } else {
@@ -132,7 +185,7 @@ enum LongHoldTest {
             print("      a non-speech annotation reached the transcript")
         }
         print("      \(text)")
-        return missing.isEmpty && !annotated ? 0 : 1
+        return (failed, words)
     }
 
     // MARK: - Fixture

@@ -259,31 +259,31 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         }
 
         let decodeStart = ContinuousClock.now
-        let results = try await whisperKit.transcribe(
-            audioArray: collected, decodeOptions: Self.decodeOptions)
+        let (pieces, recoveries, fallbacks) = try await Self.decodeWholeHold(
+            collected, with: whisperKit)
         let decodeMs = Int((ContinuousClock.now - decodeStart) / .milliseconds(1))
 
-        // Segment by segment rather than result by result, so a segment decoded
-        // out of silence can be dropped on the evidence of its own audio. Joined
-        // with a space rather than concatenated, since each is its own sentence
-        // fragment and Whisper leaves no separator between them.
+        // Piece by piece rather than result by result, so a piece decoded out of
+        // silence can be dropped on the evidence of its own audio. Joined with a
+        // space rather than concatenated, since each is its own sentence fragment
+        // and Whisper leaves no separator between them.
         var spoken: [String] = []
+        var previous: Piece?
         var invented = 0
-        for result in results {
-            guard !result.segments.isEmpty else {
-                if !result.text.isEmpty { spoken.append(result.text) }
+        for piece in pieces {
+            guard Self.spansAudibleAudio(collected, from: piece.start, to: piece.end) else {
+                invented += 1
                 continue
             }
-            for segment in result.segments where !segment.text.isEmpty {
-                guard
-                    Self.spansAudibleAudio(
-                        collected, from: Double(segment.start), to: Double(segment.end))
-                else {
-                    invented += 1
-                    continue
-                }
-                spoken.append(segment.text)
-            }
+            // A seam is where two separate decodes meet, and only there can the
+            // same words arrive twice.
+            let seam = previous.map { $0.isRecovered != piece.isRecovered } ?? false
+            let text =
+                seam
+                ? Self.trimmingOverlap(piece.text, following: spoken.last ?? "") : piece.text
+            previous = piece
+            guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            spoken.append(text)
         }
         let joined = spoken.joined(separator: " ")
         let text = TextNormalizer.finalize(Self.stripNonSpeechAnnotations(joined))
@@ -292,16 +292,432 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             report(
                 seconds: seconds, peak: peak, decodeMs: decodeMs,
                 outcome: "no words in the result, nothing inserted"
-                    + (invented > 0 ? " (\(invented) segment(s) decoded out of silence)" : ""))
+                    + (invented > 0 ? " (\(invented) segment(s) decoded out of silence)" : "")
+                    + (fallbacks > 0
+                        ? " (the decoder rejected its own output \(fallbacks) time(s))" : ""))
             finishUpdates(with: "")
             return ""
         }
 
+        var outcome: [String] = []
+        if recoveries > 0 {
+            outcome.append(
+                "decoder stopped short of the audio, \(recoveries) pass(es) recovered it")
+        }
+        if invented > 0 { outcome.append("\(invented) segment(s) decoded out of silence, dropped") }
+        if fallbacks > 0 {
+            outcome.append("the decoder rejected its own output \(fallbacks) time(s)")
+        }
         report(
             seconds: seconds, peak: peak, decodeMs: decodeMs, text: text,
-            outcome: invented > 0 ? "\(invented) segment(s) decoded out of silence, dropped" : nil)
+            outcome: outcome.isEmpty ? nil : outcome.joined(separator: "; "))
         finishUpdates(with: text)
         return text
+    }
+
+    // MARK: - Decoding the whole hold
+
+    /// One stretch of decoded text, in seconds from the start of the hold.
+    private struct Piece {
+        let start: Double
+        let end: Double
+        let text: String
+        /// Whether this came from a re-decode of audio the first pass skipped.
+        /// The joins on either side of one are the only places two decodes meet,
+        /// and so the only places the same words can be transcribed twice.
+        var isRecovered = false
+    }
+
+    /// Decodes `samples` and returns what came back, in seconds from the start
+    /// of `samples`.
+    private static func decode(
+        _ samples: [Float], with whisperKit: WhisperKit
+    ) async throws -> (pieces: [Piece], fallbacks: Int) {
+        let results = try await whisperKit.transcribe(
+            audioArray: samples, decodeOptions: decodeOptions)
+        let seconds = Double(samples.count) / sampleRate
+
+        // What the decoder thought of the audio, which is otherwise invisible.
+        // A window it has no confidence in is retried at rising temperatures and
+        // then given up on, and giving up looks exactly like a silent hold from
+        // out here — the only tell is the time, because every retry is another
+        // full decode.
+        let fallbacks = Int(results.reduce(0) { $0 + $1.timings.totalDecodingFallbacks })
+
+        var pieces: [Piece] = []
+        for result in results {
+            // A result with no segments carries no timestamps to judge it by, so
+            // it is credited with the whole slice it was decoded from.
+            guard !result.segments.isEmpty else {
+                if !result.text.isEmpty {
+                    pieces.append(Piece(start: 0, end: seconds, text: result.text))
+                }
+                continue
+            }
+            for segment in result.segments where !segment.text.isEmpty {
+                pieces.append(
+                    Piece(
+                        start: Double(segment.start), end: Double(segment.end),
+                        text: segment.text))
+            }
+        }
+        return (pieces, fallbacks)
+    }
+
+    /// Decodes the hold, re-decoding whatever audible audio the transcript does
+    /// not account for.
+    ///
+    /// **Whisper stops when it decides the utterance is over, not when the audio
+    /// runs out, and WhisperKit has no second chance to offer it.** Its seek
+    /// loop advances to the last timestamp the decoder emitted; where the
+    /// decoder emitted no usable timestamp it does `seek += segmentSize` — a
+    /// whole window. For a hold shorter than 30 s that window *is* the whole
+    /// recording, so one early stop ends the transcription there and everything
+    /// after it is thrown away, with no error and no gap in the text that reads.
+    /// Measured on a real 20.4-second latched hold: 39 words, cut mid-clause, at
+    /// 1.91 words/s against the 2-3 ordinary dictation runs at. The same failure
+    /// at a window boundary returned 26 words for 34.2 s of speech.
+    ///
+    /// So the audio, not the decoder, says how far the transcript should reach.
+    /// Any stretch of the hold that no audible piece accounts for is decoded
+    /// again on its own and the result slotted into place. The slices are
+    /// disjoint by construction, so nothing can be transcribed twice, and the
+    /// gap may be in the middle as easily as at the end — a capped decode
+    /// crossing a window boundary skips one and carries on past it, which the
+    /// tail alone would never recover.
+    ///
+    /// Every pass has to pay for itself: a gap is only decoded if it is long
+    /// enough to hold a word and loud enough to be speech, and `floor` moves
+    /// past whatever was just attempted, so a decoder that stops for its own
+    /// reasons cannot be asked the same question twice.
+    private static func decodeWholeHold(
+        _ samples: [Float], with whisperKit: WhisperKit
+    ) async throws -> (pieces: [Piece], recoveries: Int, fallbacks: Int) {
+        var (pieces, fallbacks) = try await decode(samples, with: whisperKit)
+        var floor: Double = 0
+        var recoveries = 0
+        let budget = maxRecoveryPasses(forSeconds: Double(samples.count) / sampleRate)
+
+        while recoveries < budget {
+            guard let gap = firstAudibleGap(in: pieces, of: samples, notBefore: floor) else {
+                break
+            }
+            recoveries += 1
+            let slice = span(samples, from: gap.start, to: gap.end)
+            let pass = try await decodeGap(
+                samples, from: gap.start, to: gap.end, with: whisperKit)
+            fallbacks += pass.fallbacks
+            let recovered = pass.pieces
+            let text = TextNormalizer.finalize(
+                stripNonSpeechAnnotations(recovered.map(\.text).joined(separator: " ")))
+
+            // Nothing usable came back, from the gap whole or from any of its
+            // pieces. Only now is it abandoned.
+            guard carriesWords(text), !isInventedSilence(text, peak: peakDecibels(slice)) else {
+                diagnosticLog?(
+                    String(format: "  %.1f-%.1f s was skipped by the decoder and holds no words",
+                           gap.start, gap.end))
+                floor = gap.end
+                continue
+            }
+
+            diagnosticLog?(
+                String(
+                    format: "  %.1f-%.1f s was skipped by the decoder, recovered %d word(s)",
+                    gap.start, gap.end, text.split(whereSeparator: \.isWhitespace).count))
+            pieces += recovered
+            floor = max(
+                gap.start + recoveryMinimumProgress,
+                min(coveredThrough(recovered, of: samples), gap.end))
+        }
+
+        // Recovered pieces are appended as they are found, and a gap in the
+        // middle is found after the text that follows it. The transcript is read
+        // in the order it was spoken.
+        pieces.sort { ($0.start, $0.end) < ($1.start, $1.end) }
+        return (pieces, recoveries, fallbacks)
+    }
+
+    /// Decodes one gap, and if that produces nothing, decodes it in pieces.
+    ///
+    /// **A gap re-decoded whole is the same question the decoder already
+    /// refused.** The recovery was built for a decoder that stops part-way
+    /// through a window: there the gap is a fraction of the window, so the slice
+    /// handed back is short, different, and genuinely easier. A gap that *is* a
+    /// whole window is none of those things — the slice is the same 30 seconds
+    /// padded the same way, and the answer is the same nothing.
+    ///
+    /// Measured on a real 55.2 s hold. Whisper Small returned nothing at all for
+    /// 0.2-30.0 s, the recovery handed those same 29.8 seconds straight back,
+    /// got nothing again, and abandoned the span for good:
+    ///
+    ///     0.2-30.0 s was skipped by the decoder and holds no words
+    ///     -> 183 chars, 36 words (0.65 words/s)
+    ///
+    /// Ordinary dictation runs at 2-3 words/s. Half the transcript was thrown
+    /// away by a retry that could not have succeeded. Cut into pieces the
+    /// decoder has not already refused, each one is a different problem, and the
+    /// cost is paid only on a gap that failed whole — which on a healthy decode
+    /// never happens.
+    private static func decodeGap(
+        _ samples: [Float], from start: Double, to end: Double, with whisperKit: WhisperKit
+    ) async throws -> (pieces: [Piece], fallbacks: Int) {
+        let whole = span(samples, from: start, to: end)
+        let first = try await decode(whole, with: whisperKit)
+        var fallbacks = first.fallbacks
+        if carriesUsableWords(first.pieces, decodedFrom: whole) {
+            return (recovered(first.pieces, offsetBy: start), fallbacks)
+        }
+
+        // Short gaps are left alone. Below this the slice was never the problem,
+        // and cutting it further only feeds the decoder more silence, which is
+        // what it answers with words nobody said.
+        guard end - start > subdivisionThreshold else { return ([], fallbacks) }
+
+        var collected: [Piece] = []
+        var emittedThrough = start
+        for chunk in subdivisionPlan(from: start, to: end) {
+            let audio = span(samples, from: chunk.from, to: chunk.to)
+            let pass = try await decode(audio, with: whisperKit)
+            fallbacks += pass.fallbacks
+            guard carriesUsableWords(pass.pieces, decodedFrom: audio) else {
+                emittedThrough = chunk.to
+                continue
+            }
+            // Kept by where a piece's middle falls, which drops the duplicate
+            // the overlap produces without having to edit anybody's text.
+            for piece in recovered(pass.pieces, offsetBy: chunk.from)
+            where (piece.start + piece.end) / 2 >= emittedThrough {
+                collected.append(piece)
+            }
+            emittedThrough = chunk.to
+        }
+        return (collected, fallbacks)
+    }
+
+    /// How a failed gap is cut up, as spans in seconds from the start of the
+    /// hold.
+    ///
+    /// Pure, and public, because this is where the arithmetic can be quietly
+    /// wrong: a plan that leaves a hole re-creates the very defect the
+    /// subdivision exists to fix, and a transcript reads perfectly well across
+    /// one. Each span opens `subdivisionOverlap` before the previous closed, so
+    /// a word spoken across a cut survives whole in one of them.
+    public static func subdivisionPlan(
+        from start: Double, to end: Double
+    ) -> [(from: Double, to: Double)] {
+        var plan: [(from: Double, to: Double)] = []
+        var cursor = start
+        while cursor < end {
+            let from = max(start, cursor - subdivisionOverlap)
+            let to = min(end, cursor + subdivisionSeconds)
+            // A remainder too short to hold a word is not worth a decode, and
+            // handing the model a sliver of silence is how invented words get
+            // in.
+            guard to - from >= recoveryMinimumSeconds else { break }
+            plan.append((from, to))
+            cursor = to
+        }
+        return plan
+    }
+
+    /// Whether a decode of `slice` produced anything a person could have said.
+    /// The same two questions the caller asks of a whole hold, so a piece is
+    /// held to the standard the transcript is.
+    private static func carriesUsableWords(_ pieces: [Piece], decodedFrom slice: [Float]) -> Bool {
+        let text = TextNormalizer.finalize(
+            stripNonSpeechAnnotations(pieces.map(\.text).joined(separator: " ")))
+        return carriesWords(text) && !isInventedSilence(text, peak: peakDecibels(slice))
+    }
+
+    /// Moves pieces from slice-relative seconds into hold-relative ones.
+    private static func recovered(_ pieces: [Piece], offsetBy offset: Double) -> [Piece] {
+        pieces.map {
+            Piece(start: $0.start + offset, end: $0.end + offset, text: $0.text, isRecovered: true)
+        }
+    }
+
+    /// The earliest stretch of the hold that no audible piece accounts for,
+    /// which is itself loud enough to have been speech.
+    ///
+    /// `notBefore` is what makes the loop above finite: it moves past every gap
+    /// already attempted, so each pass looks strictly further into the hold.
+    private static func firstAudibleGap(
+        in pieces: [Piece], of samples: [Float], notBefore floor: Double
+    ) -> (start: Double, end: Double)? {
+        let seconds = Double(samples.count) / sampleRate
+
+        // Only audible pieces count as coverage: Whisper stretches a trailing
+        // `[BLANK_AUDIO]` over the silence after the last word — often past the
+        // end of the recording — and that must not vouch for speech.
+        let covered = pieces
+            .filter { spansAudibleAudio(samples, from: $0.start, to: $0.end) }
+            .map { (start: max(0, min($0.start, seconds)), end: max(0, min($0.end, seconds))) }
+            .sorted { $0.start < $1.start }
+
+        var gaps: [(start: Double, end: Double)] = []
+        var cursor: Double = 0
+        for piece in covered {
+            if piece.start > cursor { gaps.append((cursor, piece.start)) }
+            cursor = max(cursor, piece.end)
+        }
+        if seconds > cursor { gaps.append((cursor, seconds)) }
+
+        for gap in gaps {
+            let start = max(gap.start, floor)
+            guard gap.end - start >= recoveryMinimumSeconds else { continue }
+            // Judged on how much of the gap is speech, not on how loud its
+            // loudest instant was — see `audibleExtent`. Decoded with a little
+            // margin either side, so a word is not clipped at the seam, and with
+            // as little silence as possible, since silence is what Whisper
+            // answers with words nobody said.
+            guard let audible = audibleExtent(samples, from: start, to: gap.end),
+                audible.end - audible.start >= recoveryMinimumSeconds
+            else { continue }
+            return (
+                max(start, audible.start - recoveryMargin),
+                min(gap.end, audible.end + recoveryMargin)
+            )
+        }
+        return nil
+    }
+
+    /// The stretch of a span that is loud enough to be speech, from the first
+    /// such moment to the last.
+    ///
+    /// A gap judged by its peak alone is judged by its loudest 25 ms, and the
+    /// gap between two sentences opens on the tail of the word before it: loud,
+    /// and a tenth of a second long. Measured on `--testlong` with Large v3
+    /// Turbo, that was enough to send five ordinary pauses to the decoder, which
+    /// answered them with "- Right.", "you", and "Thank you." three times over —
+    /// exactly the invented speech `silenceCeiling` exists to keep out, let back
+    /// in by the recovery. What decides a gap is how much of it is speech.
+    private static func audibleExtent(
+        _ samples: [Float], from start: Double, to end: Double
+    ) -> (start: Double, end: Double)? {
+        let first = max(0, min(samples.count, Int(start * sampleRate)))
+        let last = max(first, min(samples.count, Int((end * sampleRate).rounded(.up))))
+        guard first < last else { return nil }
+
+        let sliceLength = max(1, Int(sampleRate * 0.025))
+        var audibleFirst: Int?
+        var audibleLast: Int?
+        var index = first
+        while index < last {
+            let count = min(sliceLength, last - index)
+            if peakDecibels(samples, in: index..<(index + count)) > silenceCeiling {
+                if audibleFirst == nil { audibleFirst = index }
+                audibleLast = index + count
+            }
+            index += count
+        }
+        guard let audibleFirst, let audibleLast else { return nil }
+        return (Double(audibleFirst) / sampleRate, Double(audibleLast) / sampleRate)
+    }
+
+    /// How far into the hold a set of pieces reaches, counting only the ones
+    /// whose own audio is audible and clamping to the recording — those
+    /// timestamps are the model's guess, and nothing downstream can use one that
+    /// points past the audio.
+    private static func coveredThrough(_ pieces: [Piece], of samples: [Float]) -> Double {
+        let seconds = Double(samples.count) / sampleRate
+        return pieces.reduce(0.0) { furthest, piece in
+            guard spansAudibleAudio(samples, from: piece.start, to: piece.end) else {
+                return furthest
+            }
+            return max(furthest, min(piece.end, seconds))
+        }
+    }
+
+    /// The samples a span of the hold points at.
+    private static func span(_ samples: [Float], from start: Double, to end: Double) -> [Float] {
+        let first = max(0, min(samples.count, Int(start * sampleRate)))
+        let last = max(first, min(samples.count, Int((end * sampleRate).rounded(.up))))
+        return Array(samples[first..<last])
+    }
+
+    /// Removes a leading run of words that only repeats the end of what comes
+    /// before it.
+    ///
+    /// A gap is re-decoded from the last timestamp the decoder emitted, and that
+    /// timestamp says where the model stopped, not where the phrase did — so the
+    /// second decode can begin part-way through something already transcribed.
+    /// Measured on the forced-stop arm of `--testlong`: "… The barometer in the"
+    /// followed by "The barometer in the hallway has been reading …".
+    ///
+    /// Deliberately timid. It runs only at a seam the recovery itself created,
+    /// matches whole words, and needs **at least two** of them: one repeated
+    /// word is something people say, and losing a word somebody spoke is worse
+    /// than keeping one they did not.
+    public static func trimmingOverlap(_ text: String, following previous: String) -> String {
+        let head = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        let tail = previous.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard head.count >= 2, tail.count >= 2 else { return text }
+
+        let comparable = { (word: String) in
+            word.lowercased().filter { $0.isLetter || $0.isNumber }
+        }
+        let headKeys = head.map(comparable)
+        let tailKeys = tail.map(comparable)
+
+        let longest = min(maximumOverlapWords, min(headKeys.count, tailKeys.count))
+        guard longest >= 2 else { return text }
+        for length in stride(from: longest, through: 2, by: -1) {
+            guard Array(tailKeys.suffix(length)) == Array(headKeys.prefix(length)) else { continue }
+            return head.dropFirst(length).joined(separator: " ")
+        }
+        return text
+    }
+
+    /// Ceiling on what an overlap may be. Long enough for the phrase a decoder
+    /// stops in the middle of, short enough that it cannot swallow a sentence.
+    private static let maximumOverlapWords = 12
+
+    private static let sampleRate: Double = 16000
+
+    /// Shortest uncovered tail worth another decode. Below this there is no room
+    /// for a word, and the pass would cost more than it could recover.
+    private static let recoveryMinimumSeconds: Double = 1.0
+
+    /// How far a pass must move the coverage to count as progress. A decoder
+    /// that has stopped for its own reasons will stop again in the same place,
+    /// and repeating that is how a hold turns into an unbounded loop.
+    private static let recoveryMinimumProgress: Double = 0.25
+
+    /// Kept either side of the speech in a gap, so a re-decode does not open on
+    /// a half-spoken word.
+    private static let recoveryMargin: Double = 0.2
+
+    /// Above this, a gap that came back empty is decoded again in pieces rather
+    /// than abandoned. Below it, the length was never what the decoder objected
+    /// to, and cutting further only hands it more silence.
+    private static let subdivisionThreshold: Double = 15
+
+    /// How much of a failed gap one piece covers. Well under the 30-second
+    /// window, so a piece is a question the decoder has not already refused.
+    private static let subdivisionSeconds: Double = 12
+
+    /// Each piece opens this far before the previous one closed, so a word
+    /// spoken across a cut survives whole in one of them.
+    private static let subdivisionOverlap: Double = 0.3
+
+    /// Ceiling on the passes, so a pathological decode costs a bounded number of
+    /// them. One or two is what a real early stop needs; the cap is only ever
+    /// reached by a model that has stopped being useful.
+    ///
+    /// Scaled by length rather than fixed, because every 30-second window is its
+    /// own chance to come back blank: a constant sized for a one-minute hold
+    /// runs out part-way through a five-minute one and abandons the rest of the
+    /// recording silently. A short hold keeps the 8 it always had.
+    private static func maxRecoveryPasses(forSeconds seconds: Double) -> Int {
+        max(8, Int(seconds / 30) + 4)
+    }
+
+    /// `maxRecoveryPasses` for the test that holds the scaling to account. The
+    /// failure it guards is a long hold quietly running out of budget, which is
+    /// invisible in a transcript that still reads perfectly well.
+    public static func recoveryPassBudget(forSeconds seconds: Double) -> Int {
+        maxRecoveryPasses(forSeconds: seconds)
     }
 
     // MARK: - What the decode was handed, and what it gave back
@@ -390,12 +806,73 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         return output + pending
     }
 
-    /// Whether a bracketed span is one of Whisper's annotations. Compared on
-    /// letters alone, so `[BLANK_AUDIO]`, `[ Silence ]` and `[MUSIC PLAYING]`
-    /// all reduce to something on the list.
+    /// Whether a bracketed span is one of Whisper's annotations.
+    ///
+    /// Two tests, and the second exists because the first does not scale. An
+    /// exact list of phrases catches `[BLANK_AUDIO]` and `[ Silence ]`, which
+    /// the model spells the same way every time, and misses everything it
+    /// composes on the spot — `(Audience chattering)`, `(people chattering)`,
+    /// `(crowd murmuring)`, `(indistinct chatter)`. Those reached a real
+    /// transcript three times in one sentence. There is no finite list of them,
+    /// so the second test asks about the *words* instead: a short bracketed span
+    /// in which every word is non-speech vocabulary is an annotation, however
+    /// the model chose to phrase it.
     public static func isNonSpeechAnnotation(_ span: String) -> Bool {
-        nonSpeechAnnotations.contains(span.lowercased().filter { $0.isLetter })
+        if nonSpeechAnnotations.contains(span.lowercased().filter { $0.isLetter }) { return true }
+        return isNonSpeechPhrase(span)
     }
+
+    /// Whether every word of a bracketed span belongs to the vocabulary of
+    /// things that are not speech.
+    ///
+    /// Deliberately unanimous. One non-speech word is not enough — "(the music
+    /// of Tuesday)" is something a person could dictate — so a single word the
+    /// vocabulary does not know keeps the whole span. Connectives are allowed
+    /// through but cannot carry a span on their own, or "(and)" would be read as
+    /// an annotation. The length cap is the same idea from the other end: a
+    /// caption is a label, and a bracketed clause long enough to be a sentence
+    /// is the speaker talking.
+    private static func isNonSpeechPhrase(_ span: String) -> Bool {
+        let words = span.lowercased().split { !$0.isLetter }.map(String.init)
+        guard (1...maximumAnnotationWords).contains(words.count) else { return false }
+        guard words.contains(where: nonSpeechWords.contains) else { return false }
+        return words.allSatisfy { nonSpeechWords.contains($0) || annotationConnectives.contains($0) }
+    }
+
+    /// Longest bracketed span that can still be a caption rather than speech.
+    private static let maximumAnnotationWords = 4
+
+    /// Words a caption is built from: what made the sound, what the sound was,
+    /// and how it was described. Kept to things that cannot carry meaning in
+    /// dictated prose, since a word listed here is a word this app will silently
+    /// delete whenever it appears inside brackets.
+    private static let nonSpeechWords: Set<String> = [
+        // Who or what is making it.
+        "audience", "crowd", "people", "person", "man", "woman", "speaker",
+        "background", "phone", "door", "engine", "dog", "bird", "baby",
+        // What it is.
+        "audio", "sound", "sounds", "effect", "effects", "noise", "noises",
+        "static", "silence", "silent", "blank", "pause", "music", "musical",
+        "instrumental", "applause", "clapping", "cheering", "laughter",
+        "laughs", "laughing", "chuckles", "chuckling", "giggles", "giggling",
+        "chatter", "chattering", "chatters", "murmur", "murmurs", "murmuring",
+        "mumbling", "whispering", "talking", "coughs", "coughing", "cough",
+        "sighs", "sighing", "sigh", "breathing", "breathes", "breath",
+        "sniffs", "sniffing", "throat", "clears", "clearing", "typing",
+        "clicking", "footsteps", "rustling", "shuffling", "beep", "beeping",
+        "buzzing", "ringing", "rings", "wind", "rain", "traffic", "bell",
+        "alarm", "knocking", "banging", "tapping", "humming",
+        // How it is described.
+        "indistinct", "inaudible", "unintelligible", "faint", "faintly",
+        "distant", "soft", "softly", "loud", "loudly", "quiet", "quietly",
+        "continues", "continuing", "playing", "plays", "stops", "intro",
+        "outro", "upbeat",
+    ]
+
+    /// Allowed inside a caption but never enough to make one.
+    private static let annotationConnectives: Set<String> = [
+        "a", "an", "the", "and", "of", "in", "on", "over", "with", "no",
+    ]
 
     private static let nonSpeechAnnotations: Set<String> = [
         "blankaudio", "blank", "silence", "silent", "nosound", "noaudio",
@@ -478,7 +955,30 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         let first = max(0, Int(start * sampleRate))
         let last = min(samples.count, Int((end * sampleRate).rounded(.up)))
         guard first < last, last <= samples.count else { return true }
-        return peakDecibels(Array(samples[first..<last]), sampleRate: sampleRate) > silenceCeiling
+        // Measured in place rather than over a copy: this is asked once per
+        // piece, and once more per piece for every gap the recovery considers,
+        // and a slice of `[Float]` copies the samples every time.
+        return peakDecibels(samples, in: first..<last, sampleRate: sampleRate) > silenceCeiling
+    }
+
+    /// `peakDecibels` over part of an array, without copying it.
+    private static func peakDecibels(
+        _ samples: [Float], in range: Range<Int>, sampleRate: Double = 16000
+    ) -> Float {
+        guard !range.isEmpty else { return -.infinity }
+        let sliceLength = max(1, Int(sampleRate * 0.025))
+        var peak: Float = 0
+        var start = range.lowerBound
+        while start < range.upperBound {
+            let count = min(sliceLength, range.upperBound - start)
+            var meanSquare: Float = 0
+            samples.withUnsafeBufferPointer { buffer in
+                vDSP_measqv(buffer.baseAddress! + start, 1, &meanSquare, vDSP_Length(count))
+            }
+            peak = max(peak, meanSquare.squareRoot())
+            start += count
+        }
+        return 20 * log10(max(peak, 1e-7))
     }
 
     /// Whether the text contains anything a person could have said. Whisper's
@@ -537,13 +1037,28 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// this mode — see `stripNonSpeechAnnotations`. Losing words the speaker
     /// said is the worse failure of the two, and the annotations are
     /// recognizable enough to remove exactly.
-    private static let decodeOptions = DecodingOptions(
-        task: .transcribe,
-        language: "en",
-        detectLanguage: false,
-        skipSpecialTokens: true,
-        withoutTimestamps: false
-    )
+    private static var decodeOptions: DecodingOptions {
+        var options = DecodingOptions(
+            task: .transcribe,
+            language: "en",
+            detectLanguage: false,
+            skipSpecialTokens: true,
+            withoutTimestamps: false
+        )
+        if let forcedSampleLength { options.sampleLength = forcedSampleLength }
+        return options
+    }
+
+    /// Caps how many tokens one decode may sample. **Test-only, and `nil` in the
+    /// app.**
+    ///
+    /// A decoder that stops before the audio runs out is what `decodeWholeHold`
+    /// exists to answer, and real speech only does it by accident — no fixture
+    /// here has ever reproduced it on `say`-synthesized audio, which is exactly
+    /// why the defect reached a real dictation. Capping the sample length
+    /// produces the same condition on demand, so the recovery can be tested by
+    /// something that fails without it.
+    public nonisolated(unsafe) static var forcedSampleLength: Int?
 
     /// Publishes the one and only result, so callers that watch the stream see
     /// the same text that `finishSession()` returns.

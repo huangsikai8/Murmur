@@ -124,6 +124,46 @@ closed by something else stayed closed, and it is now also called when the menu
 opens and after `fail()` — which closes the device to recover and never used to
 reopen it.
 
+**Never react to `AVAudioEngineConfigurationChange` on the thread it arrives
+on.** The observer was registered with `queue: nil`, which delivers the
+notification *synchronously on whatever thread posted it* — and AVAudioEngine
+posts this one from its own internal audio thread while it is part-way through
+reconfiguring itself. `handleConfigurationChange` then took `lock` and called
+`startLocked()`, so `engine.start()` and `installTap` were reentrant calls into
+an engine still holding its own state down. That blocks, with `lock` held, and
+the next press on the main thread blocks behind it — permanently. The app has to
+be force-quit.
+
+The recipe is exact and it is somebody's ordinary afternoon: dictate on
+Bluetooth (refused, see the entry below), unplug the headset, switch output back
+to the built-in speaker, press again. Switching device produces a *burst* of
+configuration changes, not one. Captured in `Murmur.log`:
+
+    13:59:21.750  dictation press ignored: default input is Bluetooth
+    13:59:24.887  audio configuration changed while the microphone was closed
+    13:59:29.634  main thread stalled past 1.0 s
+
+with no `main thread answering again` line ever written. The reaction now hops
+to `configurationQueue`; it is the same work done anywhere else.
+
+**And the main thread must never wait on `lock` without a limit.** That is the
+second half, and it is what makes the failure survivable rather than merely less
+likely: `lock` is held across `engine.start()`, which is 15-472 ms normally and
+seconds on a device CoreAudio is still tearing down. Every caller — a press, the
+menu opening, a preference changing, `isArmed` — is on the main thread, so an
+unbounded wait is not a slow microphone. It is an app that has stopped
+answering, and with the finalize tap on the main run loop it is a keyboard that
+has stopped working in every application. `acquireLock` gives up after 500 ms
+and throws `deviceBusy`; a refused press is recoverable by pressing again, and a
+wedged main thread is recoverable only by force-quitting. `startLocked` also
+logs any open past 250 ms, because nothing else is written between the press and
+the audio and a slow open was invisible.
+
+`AudioCapture.holdDeviceLockForTesting` manufactures the condition, since the
+only other recipe is to physically disconnect a headset — same reasoning as
+`WhisperEngine.forcedSampleLength`. Two tests in `Sources/MurmurTests/` assert
+the press is refused rather than queued.
+
 **A pre-roll captured in one format must never be replayed into a session that
 asked for another.** Hands-free re-points the armed device at 16 kHz mono and
 push-to-talk points it back; whatever the roll is holding at that moment is in
@@ -343,6 +383,50 @@ guard: it buys 0.06 ms and puts new logic in the one path that can destroy the
 user's clipboard. The snapshot is now skipped entirely unless the verdict is
 `.acceptsText`, which is the only path that restores.
 
+**Putting the clipboard back on a timer pastes the *previous* transcript.**
+The restore was `asyncAfter(0.35 s)`, which is a guess about another process's
+schedule, and Chromium — Chrome, VS Code, Electron, so most of what anyone
+dictates into — reads the pasteboard *asynchronously* after the ⌘V is
+delivered. A busy renderer reads it after the restore and pastes whatever was
+put back. What gets put back is the sharp end: two outcomes deliberately leave
+the transcript on the clipboard and never restore (`leftOnClipboard`,
+`pastedUnverified` — 9 and 5 of them in one real log), and the `changeCount`
+guard skips the restore on a third, so the value sitting there when the next
+dictation starts is very often *the last transcript*. The next insertion then
+snapshots it as "the user's clipboard" and hands it back mid-paste. The
+symptom is a hold that pastes the sentence before it, occasionally, in web
+apps, and it is invisible from every log line the app writes — the transcript
+is correct, the insertion is correct, the paste lands.
+Both halves are fixed and both are needed. `isOurs` compares the pasteboard's
+`changeCount` against the one Murmur last wrote, and a board that is still
+exactly Murmur's own is never restored — so a late read can now only ever
+paste the *current* transcript twice, never a stale one. The change count, not
+the text: a speaker who copies the sentence they just dictated has a clipboard
+of their own that reads identically. And `scheduleRestore` waits for the paste
+to be *seen* — `focusedElementWatcher` reads `AXNumberOfCharacters` and
+`AXSelectedTextRange` on the focused element before the ⌘V and polls them every
+20 ms, restoring as soon as either moves, with 1.5 s as a ceiling rather than
+a schedule. Never the element's value: a paste moves the length and the caret,
+and reading the text of a large document to compare it would cost more than
+the wait it is shortening. `--testpaste` is what says the watcher can watch at
+all — an element that reports neither attribute cannot be watched, and every
+insertion then falls back to the ceiling, which would make this change a
+*slower* restore and nothing else.
+Measured with `--testpaste`, idle: TextEdit 22–24 ms, Chrome 23–60 ms, VS Code
+23–67 ms, against the flat 350 ms it used to wait. That is the shape of the
+bug — the old delay is *usually* generous, which is why this failed a few
+times a day rather than every time, and why nothing in the log ever pointed at
+it. The confirmation also costs something on the way in: `insert` itself takes
+51–66 ms the first time it touches an application and 2–5 ms after, because
+`focusedElementWatcher` asks `describeFocus` a second time and the first ask of
+a Chromium process builds its accessibility tree.
+`--testpaste` reports the extent before and after each paste for a reason: when
+a paste is *not* confirmed the two are identical, which says the text went
+somewhere else rather than that the watcher is broken. Every unconfirmed run
+here turned out to be exactly that — another application had taken keyboard
+focus — and the ceiling still restored the clipboard, which is the behaviour
+that has to hold when the answer cannot be known.
+
 **`turnAudio` is the turn detector's window and nothing else's.**
 `HandsFreeSession` kept an 8-second rolling window for every buffer whether or
 not a detector existed — 576 KB resident and a ~512 KB memmove a second, for
@@ -414,6 +498,74 @@ the ordering is what makes it safe, so do not move that call.
   matching phrases, which is why `isInventedSilence` may still only drop a hold
   entire — a real sentence elsewhere in the recording cannot vouch for a segment
   decoded out of nothing.
+* **The decoder stops when it thinks the utterance is over, not when the audio
+  runs out — and timestamps do not save you from that.** WhisperKit's seek loop
+  advances to the last timestamp the decoder emitted; where the decoder emitted
+  no usable one it does `seek += segmentSize`, a whole window. For a hold under
+  30 s that window *is* the recording, so a single early stop ends the
+  transcription there and the rest is thrown away. Nothing errors and the text
+  reads perfectly across the hole — measured on a real latched hold, 20.4 s of
+  speech came back as 39 words cut mid-clause (1.91 words/s against the 2–3
+  ordinary dictation runs at), and 34.2 s came back as 26 words. `--testsilence`,
+  `--testtail` and `--testlong` all passed throughout: `say` never does this.
+  `WhisperEngine.decodeWholeHold` therefore lets the *audio* say how far the
+  transcript should reach — any stretch no audible piece accounts for is decoded
+  again on its own and slotted into place, head, middle or tail alike.
+  Two things have to be right about that, and both were wrong first:
+  * **A gap must be judged on how much of it is speech, not on its peak.** The
+    peak is the loudest 25 ms, and the gap between two sentences opens on the
+    tail of the word before it. Measured on `--testlong`, that alone sent five
+    ordinary pauses to Turbo, which answered them with "- Right.", "you" and
+    "Thank you." three times over — the invented speech `silenceCeiling` exists
+    to keep out, let back in through the side door. `audibleExtent` requires a
+    whole second of audio above the ceiling *inside* the gap, and the decode is
+    trimmed to that extent plus 0.2 s, so the model is handed as little silence
+    as possible. That also took the normal arm from 8 recovery passes and
+    12.7 s on Turbo back to 0 passes and 3.9 s.
+  * **A gap that is itself a whole window cannot be recovered by asking again.**
+    The recovery hands the decoder the gap's own audio, which for an ordinary
+    early stop is a short slice it has not seen — a different, easier question.
+    For a gap spanning a *whole* 30-second window it is the same 30 seconds
+    padded the same way, and the answer is the same nothing. Measured on a real
+    55.2 s hold: Whisper Small returned nothing at all for 0.2-30.0 s, the
+    recovery returned nothing for the same span, and `floor = gap.end` abandoned
+    it for good — 36 words for 55 s of speech, **0.65 words/s** against the 2-3
+    ordinary dictation runs at. Half the transcript, thrown away by a retry that
+    could not have succeeded. Raising `maxRecoveryPasses` does not touch this
+    and the log says so: 4 of 8 passes were used, and each gap is attempted
+    exactly once whatever the budget. `decodeGap` now cuts a span that failed
+    whole into 12-second pieces with 0.3 s of overlap, which are questions the
+    decoder has not already refused; `subdivisionPlan` is pure and tested,
+    because a plan that leaves a hole re-creates the defect and the transcript
+    reads perfectly well straight across one.
+  * **A gap re-decoded from a timestamp starts where the model stopped, not
+    where the phrase did**, so the two decodes overlap by a few words at the
+    seam ("… The barometer in the" / "The barometer in the hallway has been
+    reading …"). `trimmingOverlap` removes it, only at a seam the recovery
+    itself created and never for a single word — one repeated word is something
+    people say.
+* **A hold that produces nothing looks exactly like a hold nobody spoke into.**
+  The transcript is empty either way, and `finishPipeline` used to hide the card
+  for both — so a failed recognition is silent, nothing reaches the document,
+  and the only evidence the words existed is a log file. Measured on a real
+  session: three holds in one minute came back empty at -25 dBFS, a level the
+  same session transcribed normally either side of them, with decodes 5-10x
+  slower than usual. `AudioCapture.speechSeconds` is what separates the two
+  cases, and it is the question **a peak cannot answer** — a peak is the loudest
+  25 ms of the hold, so one door closing in a silent room reads exactly like
+  somebody talking for six seconds. Counted from the slices `updateLevel`
+  already measures, so it costs a comparison, and only while a session owns the
+  device — idle audio goes into the pre-roll and is thrown away. Past 0.8 s of
+  it, the card now says so and `Murmur.log` records it.
+* **A slow decode is the only outward sign that Whisper gave up.** A window it
+  has no confidence in is retried at rising temperatures — `firstTokenLogProb`,
+  `compressionRatio`, `logProb` — and once the retries run out WhisperKit keeps
+  whatever the last one gave, which can be nothing at all. Every retry is
+  another full decode, so the count is visible in the time and nowhere else;
+  `report` now prints it, because 2796 ms for 2.2 s of audio and 250 ms for the
+  same audio are the same line otherwise. Not yet reproduced on a fixture:
+  broadband noise at -25 dBFS does not trip it (it comes back as
+  "(water running)" in 166 ms, no fallbacks), and `say` never does.
 * **WhisperKit's variant folders are not a pattern.** `openai_whisper-small.en`
   next to `openai_whisper-large-v3-v20240930`, which is large-v3-turbo under its
   release date, and quantized siblings like `openai_whisper-small.en_217MB` sit
@@ -570,6 +722,19 @@ The whole point of the app is that text is never corrupted, so:
   each used to branch on the model ID themselves, drifted apart, and Moonshine
   ran under the self-test while the app silently used Apple's recognizer.
 
+* A latch ends on **silence**, not on elapsed time. The thing worth ending is a
+  *forgotten* latch, and a stopwatch cannot tell one of those from somebody with
+  a lot to say — the flat two-minute cap ended both, mid-sentence and without
+  warning. `AudioCapture.speechSeconds` counts only slices loud enough to be a
+  voice, so a forgotten latch stops advancing it and a long dictation does not.
+  `latchSilenceTimeout` is 90 s; `maximumLatchDuration` stays as a 15-minute
+  backstop, because decode time scales with the audio and lands all at once when
+  the key comes up — 55 s took 3.6 s on Whisper Small, so half an hour is
+  roughly two minutes of staring at nothing.
+* The recovery budget scales with the recording. Every 30-second window is its
+  own chance to come back blank, so a constant sized for a one-minute hold runs
+  out part-way through a five-minute one and abandons the rest silently.
+
 `Sources/MurmurTests/` covers all of the above. Run it after any change to the
 text path.
 
@@ -578,7 +743,7 @@ text path.
 ```sh
 ./scripts/build-app.sh debug            # build + sign + assemble
 swift scripts/make-icon.swift           # regenerate the app icon (rarely needed)
-swift run MurmurTests                   # 151 tests, no Xcode needed
+swift run MurmurTests                   # 166 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --diagnose
 ./build/Murmur.app/Contents/MacOS/Murmur --selftest [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testcleanup
@@ -586,6 +751,8 @@ swift run MurmurTests                   # 151 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --testformatting
 ./build/Murmur.app/Contents/MacOS/Murmur --testvad [silenceSeconds]
 ./build/Murmur.app/Contents/MacOS/Murmur --testmic [iterations]
+./build/Murmur.app/Contents/MacOS/Murmur --testpaste [iterations]
+./build/Murmur.app/Contents/MacOS/Murmur --teststall [seconds]
 ./build/Murmur.app/Contents/MacOS/Murmur --testtail [modelID] [--clip ms]
 ./build/Murmur.app/Contents/MacOS/Murmur --testhandsfree [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testsilence [modelID]
@@ -615,6 +782,14 @@ finalized with no settle time, which is the latch case. `--testtail --clip 500`
 removes real speech as well and must fail; a tail test that cannot fail says
 nothing.
 
+`--testpaste` measures the far end of an insertion, which no other test here
+touches: how long the application in front takes to *read* the pasteboard after
+the ⌘V is delivered. Click into a real text field first, as with `--testfocus`.
+It has to be run against the applications actually dictated into, because the
+answer is a property of them and not of Murmur, and it asserts the two things
+that fail silently — that the focused element can be watched at all, and that
+each paste was seen to land before the clipboard was put back.
+
 `--testsilence` holds the key with nobody speaking, in four flavours of room
 tone, and every result must be empty — words there are words nobody said. It
 exists because Whisper produces them and nothing upstream stops it.
@@ -627,6 +802,16 @@ the only way that failure is visible at all. It also prints the engine's own
 report of what it was handed, so the words-per-second figure a real session
 writes to `Murmur.log` is exercised by a test. With no model ID it runs every
 installed Whisper variant.
+
+It then runs the **same hold a second time with the decoder forced to stop
+early**, through `WhisperEngine.forcedSampleLength`. That is the one condition
+no `say` fixture here has ever produced on its own and the one real speech
+produces by accident, so it is manufactured rather than waited for. The second
+arm is judged on the share of its own clean run's words it keeps, not on the
+markers: a cap that short chops the decode mid-word and can genuinely destroy
+one — "cardigan" survives one run and comes back as two words the next — while
+the span is exactly what the recovery is responsible for. Measured, that
+separates cleanly: **70–75% without the recovery, 99–101% with it.**
 
 `--testcompare` records once and replays that one recording through every
 installed speech model in turn, then prints them side by side with the contested
@@ -680,12 +865,16 @@ one run taken minutes after the download: re-measured warm, Turbo gives
 warm-up pass in `prepare()` would buy nothing. Measured on disk: Base 146 MB,
 Turbo 1569 MB, each including a ~3 MB tokenizer from a second repository.
 
-Long holds, `--testlong`, one 48.4 s utterance of 8 sentences with 2.5 s pauses:
-Base, Small and Large v3 Turbo each keep all 8 marker words, at 2.5–2.6 words/s
-against the 2.5 words/s that went in. Decode 843 ms / 1963 ms / 4057 ms. Before
-timestamps were turned on, Turbo dropped a clause at the boundary in every run
-and the other two survived synthesized speech, so a test on Base alone would
-have reported this fixed while it was not.
+Long holds, `--testlong`, one 46.7 s utterance of 8 sentences with 2.5 s pauses:
+Base, Small and Large v3 Turbo each keep all 8 marker words, at 2.6–2.7 words/s
+against the 2.5 words/s that went in. Decode 930 ms / 1940 ms / 3900 ms, with no
+recovery pass fired — on audio this clean the decoder does reach the end.
+Forced to stop early, the same three keep 99–101% of those words with one
+recovery pass each; without the recovery they keep 70–75%, losing a whole
+sentence and reading straight across the hole. Before timestamps were turned on,
+Turbo dropped a clause at the boundary in every run and the other two survived
+synthesized speech, so a test on Base alone would have reported this fixed while
+it was not.
 
 A real session that returns far fewer words than were spoken now says so:
 `whisper small: 48.4 s audio, peak -12.4 dBFS, decoded in 1963 ms -> 123 words
@@ -770,16 +959,79 @@ never be recovered from a real session. It now also writes through
 because `LatencyTracker` is driven by the hotkey it never touches; it now logs
 cleanup and total per utterance.
 
+**An event tap on the main run loop makes a hung app a dead keyboard.**
+`FinalizeKeyMonitor` installs an *active* `CGEventTap` and adds it to
+`CFRunLoopGetMain()`, so every key press on the machine is routed through this
+process's main thread and held until the callback returns. While the main
+thread answers, that is fine. While it does not, it is not a frozen menu bar
+icon — it is a keyboard that has stopped working in every application at once.
+Observed on a real session: menu bar unresponsive, no key reaching any app, and
+**Spotlight still typing normally**, which is the signature, because Spotlight
+is serviced outside the session tap's path. Do not debug this as a keyboard
+fault or a stuck modifier.
+The app already contains stalls big enough to do it — a 4599 ms speech model
+load is in an ordinary launch log, a 3569 ms Whisper decode in an ordinary
+hold, and the `cleanup 75560 ms` recorded further down this file would take the
+keyboard with it for over a minute.
+The repair cannot live in the callback. Code that notices the stall and stops
+consuming would itself run on the main thread, which is the thread that is
+stuck, so it never executes. `CGEvent.tapEnable` is safe to call from any
+thread, so `MainThreadWatchdog` pings the main thread every 100 ms from its own
+queue and `KeyboardTapGate.suspend()` switches the tap off after 300 ms of
+silence, resuming when the main thread replies. Measured with `--teststall`:
+released **23 ms** into a manufactured 2 s stall, resumed on recovery. The cost
+is that Return is not swallowed while suspended, which is one mistimed Return
+against a keyboard that does not work anywhere.
+The second half is that the callback must **not** undo it. macOS disables a tap
+that is too slow and delivers `.tapDisabledByTimeout`, and the documented
+recovery is to re-enable — but from inside the callback the system's timeout and
+the watchdog's deliberate suspension look identical, and re-enabling the second
+hands every keystroke straight back to a thread that is still stuck. The handler
+checks `KeyboardTapGate.isSuspended` first.
+
+**A hang leaves no evidence, and relaunching used to destroy what there was.**
+There is no crash report, no spindump, and no log line saying the app stopped
+answering — the only record is whatever it had written before it stopped. And
+`Log.startSession()` did `removeItem` on `Murmur.log` at every launch, so the
+first thing anyone does with a hung menu bar app, force-quit and start it again,
+erased the run that mattered. It now moves the file to `Murmur.log.1` instead.
+One generation is enough: the interesting run is always the one immediately
+before the relaunch. `MainThreadWatchdog` also writes a stall past 1.0 s into the
+log with the duration, so the failure names itself rather than being inferred
+from a user saying the machine froze.
+
 **A toggle shortcut cannot use the hold-to-talk mechanism.** `HotkeyMonitor`
 uses passive `NSEvent` global monitors, which observe without consuming — fine
 for holding a bare modifier, wrong for claiming a chord, because ⌥⌘D would also
-reach the app in front and trigger its own. `ToggleShortcutMonitor` uses Carbon
+reach the app in front and trigger its own. `ShortcutMonitor` uses Carbon
 `RegisterEventHotKey` instead, which consumes the event and needs no permission
 at all. Carbon reports a *held* chord as repeated presses, so it debounces:
 without that, holding the keys flips hands-free back and forth and reads as the
 shortcut not working. Toggling is also serialized in `MenuBarController` —
 `startHandsFree` takes seconds to load its models, and a press arriving inside
 that window would queue up and undo the switch the moment it finished.
+
+**More than one chord means more than one monitor, and the single-shortcut
+shape does not stretch.** `ShortcutMonitor` held the live instance in one
+static `active` and registered every hotkey under id 1, which is invisible
+while there is one shortcut and silently wrong the moment there are two: the
+second instance replaces the first in `active`, and the Carbon handler cannot
+tell the presses apart anyway. Each instance now takes its own id, the handler
+is installed once for the process — `InstallEventHandler` on the dispatcher
+target delivers *every* hotkey press to *every* handler installed — and it
+dispatches on the id the event carries. Shortcuts are recorded from a real key
+press rather than chosen from a list of five presets, so `KeyChord` stores the
+key code, the Carbon modifier mask, and the label the key printed *at the time
+it was recorded*: asking the current keyboard layout what `kVK_ANSI_D` prints
+would relabel somebody's shortcut when they switch layout, while the key they
+physically press has not moved. A chord with no ⌘, ⌥ or ⌃ is refused — a global
+hotkey on a bare key claims it in every application for as long as Murmur runs,
+and ⇧D is a capital D. `ShortcutRecorder` is a singleton for a reason of the
+same kind: a local `NSEvent` monitor is not exclusive, so two fields left
+recording at once would both claim the same press. `KeyChord` lives in
+`MurmurCore` rather than beside the monitor for the same reason
+`StartupAudioBuffer` does — the app target cannot be imported, so anything in
+it is testable only through the app's own `--test…` commands.
 
 **A first-partial number means nothing unless the audio is replayed in real
 time.** `--selftest` feeds a whole utterance as fast as the CPU can push it, so
