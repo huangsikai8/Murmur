@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import Foundation
 import MurmurCore
 
@@ -97,4 +98,34 @@ final class RecordingEngine: SpeechRecognitionEngine, @unchecked Sendable {
     func finishSession() async throws -> String { "" }
     func cancelSession() async {}
     func releaseModels() async {}
+}
+
+/// A latch the injected paste watcher reads, so a test can decide when the
+/// paste "lands".
+final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+        set {
+            lock.lock()
+            storage = newValue
+            lock.unlock()
+        }
+    }
+}
+
+/// One key press, as the shortcut recorder would receive it.
+func keyPress(
+    _ characters: String, modifiers: NSEvent.ModifierFlags, keyCode: UInt16 = 2
+) -> NSEvent {
+    NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0,
+        windowNumber: 0, context: nil, characters: characters,
+        charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode)!
 }

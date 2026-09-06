@@ -1,14 +1,14 @@
 import AppKit
 import Carbon.HIToolbox
 import Foundation
+import MurmurCore
 
-/// A chord that toggles hands-free dictation on and off.
+/// The fixed chords the hands-free toggle used to be chosen from.
 ///
-/// Deliberately separate from `Hotkey`. Hold-to-talk keys are bare modifiers
-/// with press-and-hold semantics; a toggle has to be a chord, because a bare
-/// modifier tapped once is indistinguishable from the same modifier being used
-/// for anything else.
-public enum ToggleShortcut: String, CaseIterable, Codable, Sendable, Identifiable {
+/// Kept only to read a preference written by an older build: shortcuts are
+/// recorded now, so nothing new is ever stored in this form. `chord` is the
+/// whole of the migration.
+enum ToggleShortcut: String, CaseIterable, Codable, Sendable, Identifiable {
     case none
     case optionCommandD
     case controlOptionD
@@ -16,36 +16,31 @@ public enum ToggleShortcut: String, CaseIterable, Codable, Sendable, Identifiabl
     case controlOptionSpace
     case shiftCommandD
 
-    public var id: String { rawValue }
+    var id: String { rawValue }
 
-    public var displayName: String {
-        switch self {
-        case .none: "Off"
-        case .optionCommandD: "⌥⌘D"
-        case .controlOptionD: "⌃⌥D"
-        case .optionCommandH: "⌥⌘H"
-        case .controlOptionSpace: "⌃⌥Space"
-        case .shiftCommandD: "⇧⌘D"
-        }
-    }
-
-    var keyCode: UInt32? {
+    var chord: KeyChord? {
         switch self {
         case .none: nil
-        case .optionCommandD, .controlOptionD, .shiftCommandD: UInt32(kVK_ANSI_D)
-        case .optionCommandH: UInt32(kVK_ANSI_H)
-        case .controlOptionSpace: UInt32(kVK_Space)
-        }
-    }
-
-    /// Carbon modifier mask, which is not the same set of constants as
-    /// `NSEvent.ModifierFlags`.
-    var carbonModifiers: UInt32 {
-        switch self {
-        case .none: 0
-        case .optionCommandD, .optionCommandH: UInt32(optionKey | cmdKey)
-        case .controlOptionD, .controlOptionSpace: UInt32(controlKey | optionKey)
-        case .shiftCommandD: UInt32(shiftKey | cmdKey)
+        case .optionCommandD:
+            KeyChord(
+                keyCode: UInt32(kVK_ANSI_D), carbonModifiers: UInt32(optionKey | cmdKey),
+                keyLabel: "D")
+        case .controlOptionD:
+            KeyChord(
+                keyCode: UInt32(kVK_ANSI_D), carbonModifiers: UInt32(controlKey | optionKey),
+                keyLabel: "D")
+        case .optionCommandH:
+            KeyChord(
+                keyCode: UInt32(kVK_ANSI_H), carbonModifiers: UInt32(optionKey | cmdKey),
+                keyLabel: "H")
+        case .controlOptionSpace:
+            KeyChord(
+                keyCode: UInt32(kVK_Space), carbonModifiers: UInt32(controlKey | optionKey),
+                keyLabel: "Space")
+        case .shiftCommandD:
+            KeyChord(
+                keyCode: UInt32(kVK_ANSI_D), carbonModifiers: UInt32(shiftKey | cmdKey),
+                keyLabel: "D")
         }
     }
 }
@@ -54,23 +49,33 @@ public enum ToggleShortcut: String, CaseIterable, Codable, Sendable, Identifiabl
 ///
 /// Uses Carbon's `RegisterEventHotKey` rather than the `NSEvent` global monitor
 /// that `HotkeyMonitor` uses, for one reason: a Carbon hotkey **consumes** the
-/// event. `NSEvent` monitors are passive, so a toggle bound to ⌥⌘D would also
+/// event. `NSEvent` monitors are passive, so a chord bound to ⌥⌘D would also
 /// reach whatever application is frontmost and trigger its own ⌥⌘D. Holding a
 /// bare modifier can be observed passively; claiming a chord cannot.
 ///
 /// It also needs no permission at all, where the passive monitors need
 /// Accessibility.
+///
+/// More than one of these can be live at a time — hands-free and the history
+/// window each own one — so every instance takes its own hotkey id and the
+/// single Carbon handler dispatches on it. One shared `active` monitor, which
+/// is what this had while there was only one shortcut, would have meant the
+/// second one silently replacing the first.
 @MainActor
-public final class ToggleShortcutMonitor {
+final class ShortcutMonitor {
 
-    public var shortcut: ToggleShortcut {
+    var chord: KeyChord? {
         didSet {
-            guard shortcut != oldValue else { return }
+            guard chord != oldValue else { return }
             register()
         }
     }
 
-    public var onTrigger: (() -> Void)?
+    var onTrigger: (() -> Void)?
+
+    /// Named in the log, so a chord another application already owns can be
+    /// told apart from one that is simply not bound.
+    private let name: String
 
     /// Carbon reports a held chord as repeated presses. Left alone that flips
     /// the mode back and forth for as long as the keys are down, which reads as
@@ -78,40 +83,46 @@ public final class ToggleShortcutMonitor {
     private var lastFired: ContinuousClock.Instant?
     private static let repeatGuard = Duration.milliseconds(400)
 
+    private let identifier: UInt32
     private var hotKeyRef: EventHotKeyRef?
-    private var handlerRef: EventHandlerRef?
     private var isStarted = false
 
     /// The Carbon callback is a C function pointer and cannot capture, so the
-    /// live monitor is reached through this instead.
-    nonisolated(unsafe) fileprivate static weak var active: ToggleShortcutMonitor?
+    /// live monitors are reached through this instead, keyed by the hotkey id
+    /// the event carries.
+    private static var monitors: [UInt32: ShortcutMonitor] = [:]
+    private static var nextIdentifier: UInt32 = 1
+    /// One handler for the process, not one per monitor: `InstallEventHandler`
+    /// on the dispatcher target would otherwise deliver every hotkey press to
+    /// every handler installed.
+    private static var handlerRef: EventHandlerRef?
 
-    public init(shortcut: ToggleShortcut = .none) {
-        self.shortcut = shortcut
+    init(name: String, chord: KeyChord? = nil) {
+        self.name = name
+        self.chord = chord
+        identifier = Self.nextIdentifier
+        Self.nextIdentifier += 1
     }
 
     deinit {
         if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
-        if let handlerRef { RemoveEventHandler(handlerRef) }
     }
 
-    public func start() {
+    func start() {
         guard !isStarted else { return }
         isStarted = true
-        Self.active = self
-        installHandler()
+        Self.monitors[identifier] = self
+        Self.installHandler()
         register()
     }
 
-    public func stop() {
+    func stop() {
         isStarted = false
         unregister()
-        if let handlerRef { RemoveEventHandler(handlerRef) }
-        handlerRef = nil
-        if Self.active === self { Self.active = nil }
+        Self.monitors[identifier] = nil
     }
 
-    private func installHandler() {
+    private static func installHandler() {
         guard handlerRef == nil else { return }
         var spec = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
@@ -129,7 +140,8 @@ public final class ToggleShortcutMonitor {
                 guard status == noErr, identifier.signature == murmurHotKeySignature else {
                     return OSStatus(eventNotHandledErr)
                 }
-                Task { @MainActor in ToggleShortcutMonitor.active?.fire() }
+                let id = identifier.id
+                Task { @MainActor in ShortcutMonitor.monitors[id]?.fire() }
                 return noErr
             },
             1, &spec, nil, &handlerRef)
@@ -137,19 +149,19 @@ public final class ToggleShortcutMonitor {
 
     private func register() {
         unregister()
-        guard isStarted, let keyCode = shortcut.keyCode else { return }
+        guard isStarted, let chord else { return }
 
         var reference: EventHotKeyRef?
-        let identifier = EventHotKeyID(signature: murmurHotKeySignature, id: 1)
+        let hotKeyID = EventHotKeyID(signature: murmurHotKeySignature, id: identifier)
         let status = RegisterEventHotKey(
-            keyCode, shortcut.carbonModifiers, identifier,
+            chord.keyCode, chord.carbonModifiers, hotKeyID,
             GetEventDispatcherTarget(), 0, &reference)
 
         // A chord another application already claimed cannot be registered, and
         // the failure is silent from the user's side — they press it and
         // nothing happens — so it is worth a line in the log.
         guard status == noErr else {
-            Log.write("could not register \(shortcut.displayName): OSStatus \(status)")
+            Log.write("could not register \(chord.displayName) for \(name): OSStatus \(status)")
             return
         }
         hotKeyRef = reference

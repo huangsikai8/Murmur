@@ -19,6 +19,8 @@ final class Preferences: ObservableObject {
         static let handsFreeIdleMinutes = "murmur.handsFreeIdleMinutes"
         static let formatting = "murmur.formatting"
         static let handsFreeToggleShortcut = "murmur.handsFreeToggleShortcut"
+        static let handsFreeToggleChord = "murmur.handsFreeToggleChord"
+        static let historyChord = "murmur.historyChord"
         static let usesTurnDetector = "murmur.usesTurnDetector"
         static let turnDetectorThreshold = "murmur.turnDetectorThreshold"
         static let turnSilenceMilliseconds = "murmur.turnSilenceMilliseconds"
@@ -78,10 +80,30 @@ final class Preferences: ObservableObject {
     }
 
     /// Chord that turns hands-free on and off without the menu.
-    @Published var handsFreeToggleShortcut: ToggleShortcut {
-        didSet {
-            defaults.set(handsFreeToggleShortcut.rawValue, forKey: Key.handsFreeToggleShortcut)
-        }
+    @Published var handsFreeToggleChord: KeyChord? {
+        didSet { store(handsFreeToggleChord, forKey: Key.handsFreeToggleChord) }
+    }
+
+    /// Chord that opens the window on the History tab.
+    @Published var historyChord: KeyChord? {
+        didSet { store(historyChord, forKey: Key.historyChord) }
+    }
+
+    /// "No shortcut" is a choice, and it is written as empty data rather than
+    /// as no data at all: removing the key would read as never having been set
+    /// on the next launch, and the migration below would hand back the preset
+    /// the speaker had just cleared.
+    private func store(_ chord: KeyChord?, forKey key: String) {
+        let data = chord.flatMap { try? JSONEncoder().encode($0) } ?? Data()
+        defaults.set(data, forKey: key)
+    }
+
+    /// Outer nil means nothing was ever stored under `key`; inner nil means a
+    /// shortcut was stored and then cleared.
+    private static func chord(_ defaults: UserDefaults, forKey key: String) -> KeyChord?? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        guard !data.isEmpty else { return .some(nil) }
+        return try? JSONDecoder().decode(KeyChord.self, from: data)
     }
 
     /// Whether a pause is judged by the turn model or by a stopwatch alone.
@@ -167,9 +189,14 @@ final class Preferences: ObservableObject {
         handsFreeSilenceMilliseconds = silence > 0 ? silence : 500
         let idle = defaults.object(forKey: Key.handsFreeIdleMinutes) as? Int
         handsFreeIdleMinutes = idle ?? 30
-        handsFreeToggleShortcut =
-            (defaults.string(forKey: Key.handsFreeToggleShortcut)
-                .flatMap(ToggleShortcut.init(rawValue:))) ?? .none
+        // Recorded chords now, but a preference written by an older build
+        // names one of the five presets, and losing somebody's shortcut on an
+        // upgrade is the kind of small betrayal nobody reports.
+        handsFreeToggleChord =
+            Self.chord(defaults, forKey: Key.handsFreeToggleChord)
+            ?? defaults.string(forKey: Key.handsFreeToggleShortcut)
+                .flatMap(ToggleShortcut.init(rawValue:))?.chord
+        historyChord = Self.chord(defaults, forKey: Key.historyChord) ?? nil
         // `object(forKey:)` rather than `bool`/`double`, so that "never set"
         // is distinguishable from a deliberate false or zero. Reading these
         // with the plain accessors would turn a first run into "turn detector

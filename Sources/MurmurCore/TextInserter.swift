@@ -76,23 +76,71 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
     /// could not be exercised at all.
     public typealias FocusProbe = @Sendable (pid_t?) -> FocusVerdict
 
+    /// Watches the place the text was sent to and reports whether it has
+    /// arrived yet.
+    ///
+    /// Returns `nil` when there is nothing to watch — an element that reports
+    /// neither a length nor a caret cannot answer the question, and a watcher
+    /// that always says "not yet" would hold the clipboard for the full
+    /// ceiling on every utterance. Injected for the same reason the probe is:
+    /// a test process has no focused field.
+    public typealias PasteWatcher = @Sendable (pid_t?) -> (@Sendable () -> Bool)?
+
     private let pasteboard: NSPasteboard
     private let paste: PasteAction
     private let restoreDelay: TimeInterval
     private let canReceiveText: FocusProbe
+    private let watchPaste: PasteWatcher
     private let queue = DispatchQueue(label: "com.sikaihuang.murmur.clipboard")
+
+    /// The change count the pasteboard had when Murmur last wrote a transcript
+    /// to it.
+    ///
+    /// Kept so a transcript is never mistaken for the user's own clipboard and
+    /// handed back in the middle of a paste — see `insert`. The change count
+    /// rather than the text: it is exact where comparing strings is a guess,
+    /// since a speaker who copies the sentence they just dictated has a
+    /// clipboard of their own that happens to read the same. Static because
+    /// the question is whether *Murmur* put it there, which is not a question
+    /// about any one inserter. Keyed by pasteboard, because a change count is
+    /// only meaningful on the board it was read from.
+    private nonisolated(unsafe) static var placedChangeCounts: [NSPasteboard.Name: Int] = [:]
+    private static let placedLock = NSLock()
 
     public init(
         pasteboard: NSPasteboard = .general,
-        restoreDelay: TimeInterval = 0.35,
+        restoreDelay: TimeInterval = ClipboardPasteInserter.confirmationCeiling,
         paste: @escaping PasteAction = ClipboardPasteInserter.synthesizeCommandV,
-        canReceiveText: @escaping FocusProbe = ClipboardPasteInserter.focusedElementAcceptsText
+        canReceiveText: @escaping FocusProbe = ClipboardPasteInserter.focusedElementAcceptsText,
+        watchPaste: @escaping PasteWatcher = ClipboardPasteInserter.focusedElementWatcher
     ) {
         self.pasteboard = pasteboard
         self.restoreDelay = restoreDelay
         self.paste = paste
         self.canReceiveText = canReceiveText
+        self.watchPaste = watchPaste
     }
+
+    /// Longest the transcript is left on the pasteboard when the paste cannot
+    /// be confirmed to have landed.
+    ///
+    /// The old behaviour was this alone, at 0.35 s, and 0.35 s is a guess about
+    /// somebody else's process. Chromium — Chrome, VS Code, Electron apps —
+    /// reads the pasteboard asynchronously after the ⌘V is delivered, so a busy
+    /// renderer reads it *after* the restore and pastes whatever was put back.
+    /// Long enough to cover that, and paid only when nothing can be watched:
+    /// a confirmed paste restores as soon as the text appears.
+    public static let confirmationCeiling: TimeInterval = 1.5
+
+    /// How often the target is asked whether the text has arrived. Two
+    /// attribute reads on one element — a length and a caret position, never
+    /// the text itself, which on a large document would be the expensive one.
+    private static let confirmationInterval: TimeInterval = 0.02
+
+    /// Waited after the text is seen to arrive. The insertion happens after the
+    /// application has read the pasteboard, so this is margin rather than
+    /// necessity.
+    private static let confirmationGrace: TimeInterval = 0.05
 
     @discardableResult
     public func insert(_ text: String, into targetProcess: pid_t? = nil) throws
@@ -106,13 +154,29 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
         // the previous clipboard and never costs the transcript.
         let verdict = canReceiveText(targetProcess)
 
+        // A transcript this inserter left behind is not the user's clipboard,
+        // and putting it back is how the *previous* utterance ends up pasted
+        // in place of this one: two paths here deliberately leave the words on
+        // the pasteboard (`leftOnClipboard`, `pastedUnverified`) and the
+        // changeCount guard skips the restore on a third, so the value sitting
+        // there when the next dictation starts is very often the last
+        // transcript. Restoring nothing leaves the current transcript in
+        // place, so a late read can only ever paste the right words twice.
+        let ours = Self.isOurs(pasteboard.changeCount, on: pasteboard)
+
         // Only the accepting path restores, so on the other two this was a
         // copy of the whole pasteboard taken to be discarded a few lines later.
-        let saved = verdict == .acceptsText ? Self.snapshot(pasteboard) : []
+        let restores = verdict == .acceptsText && !ours
+        let saved = restores ? Self.snapshot(pasteboard) : []
+
+        // Snapshotted before the paste is posted, so what it compares against
+        // is the state of the field before anything arrived in it.
+        let confirm = restores ? watchPaste(targetProcess) : nil
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         let ownedChangeCount = pasteboard.changeCount
+        Self.remember(ownedChangeCount, on: pasteboard)
 
         paste()
 
@@ -122,14 +186,81 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
             // silently discard a sentence that was just spoken.
             return verdict == .unknown ? .pastedUnverified : .leftOnClipboard
         }
-
-        // Restore only if nothing else has claimed the pasteboard since, so a
-        // copy the user makes during the delay is never clobbered.
-        queue.asyncAfter(deadline: .now() + restoreDelay) { [pasteboard] in
-            guard pasteboard.changeCount == ownedChangeCount else { return }
-            Self.restore(saved, to: pasteboard)
+        guard restores else {
+            Self.report("clipboard held Murmur's own last transcript; not restoring it")
+            return .pasted
         }
+
+        scheduleRestore(saved, ownedChangeCount: ownedChangeCount, confirm: confirm)
         return .pasted
+    }
+
+    private static func remember(_ changeCount: Int, on pasteboard: NSPasteboard) {
+        placedLock.lock()
+        placedChangeCounts[pasteboard.name] = changeCount
+        placedLock.unlock()
+    }
+
+    /// Whether what is on the pasteboard now is a transcript Murmur left there,
+    /// untouched since.
+    private static func isOurs(_ changeCount: Int, on pasteboard: NSPasteboard) -> Bool {
+        placedLock.lock()
+        defer { placedLock.unlock() }
+        return changeCount == placedChangeCounts[pasteboard.name]
+    }
+
+    // MARK: - Putting the clipboard back
+
+    /// Restores `saved` once the paste has landed, or at the ceiling if that
+    /// can never be established.
+    ///
+    /// Restoring on a timer alone is a guess about another process's schedule,
+    /// and it is wrong in exactly the case that matters: an application that
+    /// reads the pasteboard asynchronously reads it after the restore and
+    /// pastes the value that was put back. Every restore is also conditional on
+    /// nothing else having claimed the pasteboard since, so a copy the user
+    /// makes while this is waiting is never clobbered.
+    private func scheduleRestore(
+        _ saved: [NSPasteboardItem], ownedChangeCount: Int, confirm: (@Sendable () -> Bool)?
+    ) {
+        let started = ContinuousClock.now
+        guard let confirm else {
+            queue.asyncAfter(deadline: .now() + restoreDelay) { [pasteboard] in
+                guard pasteboard.changeCount == ownedChangeCount else { return }
+                Self.restore(saved, to: pasteboard)
+            }
+            return
+        }
+        poll(saved, ownedChangeCount: ownedChangeCount, confirm: confirm, since: started)
+    }
+
+    private func poll(
+        _ saved: [NSPasteboardItem], ownedChangeCount: Int, confirm: @escaping @Sendable () -> Bool,
+        since started: ContinuousClock.Instant
+    ) {
+        queue.asyncAfter(deadline: .now() + Self.confirmationInterval) { [self, pasteboard] in
+            guard pasteboard.changeCount == ownedChangeCount else { return }
+
+            let waited = ContinuousClock.now - started
+            let waitedMs = Int(waited / .milliseconds(1))
+            if confirm() {
+                queue.asyncAfter(deadline: .now() + Self.confirmationGrace) {
+                    guard pasteboard.changeCount == ownedChangeCount else { return }
+                    Self.restore(saved, to: pasteboard)
+                    Self.report(
+                        "paste landed after \(waitedMs) ms, clipboard restored")
+                }
+                return
+            }
+            guard waited < .seconds(restoreDelay) else {
+                Self.restore(saved, to: pasteboard)
+                Self.report(
+                    "paste not seen to land within \(waitedMs) ms, "
+                        + "clipboard restored anyway")
+                return
+            }
+            poll(saved, ownedChangeCount: ownedChangeCount, confirm: confirm, since: started)
+        }
     }
 
     // MARK: - Is there anywhere for the text to go?
@@ -140,6 +271,59 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
 
     public static let focusedElementAcceptsText: FocusProbe = { target in
         describeFocus(target: target).verdict
+    }
+
+    /// Watches the focused element for text arriving in it.
+    ///
+    /// The two attributes read are a length and a caret position, never the
+    /// value: a paste moves both, and on a large document reading the text
+    /// itself to compare it would cost more than the wait it is shortening.
+    /// An element that reports neither cannot be watched, and `nil` sends the
+    /// restore back to the ceiling rather than to a watcher that would never
+    /// say yes.
+    /// What `focusedElementWatcher` reads, for `--testpaste` to print.
+    public static func focusedElementExtent(target: pid_t?) -> String? {
+        guard let element = describeFocus(target: target).element else { return nil }
+        return textExtent(of: element)
+    }
+
+    public static let focusedElementWatcher: PasteWatcher = { target in
+        guard let element = describeFocus(target: target).element else { return nil }
+        // A hung or busy application must not stall the polling queue: these
+        // reads happen every 20 ms and the answer is only ever advisory.
+        AXUIElementSetMessagingTimeout(element, 0.1)
+        guard let before = textExtent(of: element) else { return nil }
+        return { textExtent(of: element).map { $0 != before } ?? false }
+    }
+
+    /// How much text the element holds and where the caret sits in it.
+    ///
+    /// Both move when text is pasted, and either one alone is enough — a field
+    /// that reports no length still moves its caret, and one that reports no
+    /// caret still grows.
+    static func textExtent(of element: AXUIElement) -> String? {
+        var parts: [String] = []
+
+        var characters: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            element, kAXNumberOfCharactersAttribute as CFString, &characters) == .success,
+            let count = characters as? Int
+        {
+            parts.append("n=\(count)")
+        }
+
+        var selection: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            element, kAXSelectedTextRangeAttribute as CFString, &selection) == .success,
+            let value = selection, CFGetTypeID(value) == AXValueGetTypeID()
+        {
+            var range = CFRange()
+            if AXValueGetValue(value as! AXValue, .cfRange, &range) {
+                parts.append("caret=\(range.location)+\(range.length)")
+            }
+        }
+
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
     /// What has keyboard focus in the application the text is going to, and
@@ -158,7 +342,7 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
     /// focused. That target is captured on the hotkey, before any of this
     /// churn, and it is where the paste is going.
     public static func describeFocus(target: pid_t? = nil)
-        -> (description: String, verdict: FocusVerdict)
+        -> (description: String, verdict: FocusVerdict, element: AXUIElement?)
     {
         var attempts: [String] = []
 
@@ -210,7 +394,8 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
                     + "-> \(accepts ? "paste" : "clipboard")")
             return (
                 "\(name), settable=\(settableText), via \(query.name)",
-                accepts ? .acceptsText : .rejectsText
+                accepts ? .acceptsText : .rejectsText,
+                accepts ? element : nil
             )
         }
 
@@ -222,7 +407,7 @@ public final class ClipboardPasteInserter: TextInserting, @unchecked Sendable {
         // worse than the silence, and the transcript is kept on the clipboard
         // either way so nothing is lost.
         report("focus: \(attempts.joined(separator: ", ")) -> unreadable, pasting anyway")
-        return ("unreadable (\(attempts.joined(separator: ", ")))", .unknown)
+        return ("unreadable (\(attempts.joined(separator: ", ")))", .unknown, nil)
     }
 
     /// The elements worth asking, most authoritative first, each named for the

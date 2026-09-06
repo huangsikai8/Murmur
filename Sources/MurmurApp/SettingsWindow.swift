@@ -2,6 +2,22 @@ import AppKit
 import MurmurCore
 import SwiftUI
 
+/// Which tab the window opens on.
+enum SettingsTab: Hashable {
+    case general, cleanup, words, models, history
+}
+
+/// The tab the window is showing.
+///
+/// Held outside the view because the window is built once and kept
+/// (`isReleasedWhenClosed = false`), so opening it a second time cannot pass a
+/// new value in through the initializer — a `@State` would keep whichever tab
+/// the speaker last clicked and the history shortcut would open on that.
+@MainActor
+final class SettingsSelection: ObservableObject {
+    @Published var tab: SettingsTab = .general
+}
+
 /// The settings window, opened from the menu bar.
 @MainActor
 final class SettingsWindowController {
@@ -10,17 +26,19 @@ final class SettingsWindowController {
     private let preferences: Preferences
     private let onChange: () -> Void
     private let loginItem = LoginItem()
+    private let selection = SettingsSelection()
 
     init(preferences: Preferences, onChange: @escaping () -> Void) {
         self.preferences = preferences
         self.onChange = onChange
     }
 
-    func show() {
+    func show(tab: SettingsTab? = nil) {
         // Login Items can be switched off in System Settings without telling
         // the app, and the window below is built once and kept, so `.onAppear`
         // fires only the first time a tab is shown. Re-read on every open.
         loginItem.refresh()
+        if let tab { selection.tab = tab }
 
         if let window {
             window.makeKeyAndOrderFront(nil)
@@ -29,7 +47,8 @@ final class SettingsWindowController {
         }
 
         let view = SettingsView(
-            preferences: preferences, loginItem: loginItem, onChange: onChange)
+            preferences: preferences, loginItem: loginItem, selection: selection,
+            onChange: onChange)
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
         window.title = "Murmur Settings"
@@ -48,20 +67,26 @@ final class SettingsWindowController {
 private struct SettingsView: View {
     @ObservedObject var preferences: Preferences
     @ObservedObject var loginItem: LoginItem
+    @ObservedObject var selection: SettingsSelection
     let onChange: () -> Void
 
     var body: some View {
-        TabView {
+        TabView(selection: $selection.tab) {
             GeneralSettings(preferences: preferences, loginItem: loginItem, onChange: onChange)
                 .tabItem { Label("General", systemImage: "keyboard") }
+                .tag(SettingsTab.general)
             CleanupSettings(preferences: preferences, onChange: onChange)
                 .tabItem { Label("Cleanup", systemImage: "wand.and.stars") }
+                .tag(SettingsTab.cleanup)
             VocabularySettings(onChange: onChange)
                 .tabItem { Label("Words", systemImage: "character.book.closed") }
+                .tag(SettingsTab.words)
             ModelSettings(onChange: onChange)
                 .tabItem { Label("Models", systemImage: "shippingbox") }
+                .tag(SettingsTab.models)
             HistorySettings()
                 .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
+                .tag(SettingsTab.history)
         }
         .frame(width: 620, height: 520)
     }
@@ -143,17 +168,25 @@ private struct GeneralSettings: View {
                     .foregroundStyle(.secondary)
                 }
 
-                Picker("Hands-free toggle", selection: $preferences.handsFreeToggleShortcut) {
-                    ForEach(ToggleShortcut.allCases) { shortcut in
-                        Text(shortcut.displayName).tag(shortcut)
-                    }
-                }
-                .onChange(of: preferences.handsFreeToggleShortcut) { _, _ in onChange() }
+                ShortcutField(
+                    title: "Hands-free toggle", chord: $preferences.handsFreeToggleChord,
+                    onChange: onChange)
 
                 Text(
                     "Switches continuous dictation on and off from anywhere. This "
                         + "chord is claimed exclusively, so the app in front will not "
                         + "act on it as well."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+                ShortcutField(
+                    title: "Show history", chord: $preferences.historyChord,
+                    onChange: onChange)
+
+                Text(
+                    "Opens this window on the History tab, wherever you are. Click a "
+                        + "shortcut and press the keys you want; Delete removes it."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)

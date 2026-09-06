@@ -8,7 +8,8 @@ final class MenuBarController {
     private let statusItem: NSStatusItem
     private let controller: DictationController
     private let hotkeyMonitor: HotkeyMonitor
-    private let toggleMonitor = ToggleShortcutMonitor()
+    private let toggleMonitor = ShortcutMonitor(name: "hands-free toggle")
+    private let historyMonitor = ShortcutMonitor(name: "show history")
     private let menu = NSMenu()
 
     private var statusMenuItem = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
@@ -42,6 +43,11 @@ final class MenuBarController {
             self?.toggleHandsFree()
         }
         toggleMonitor.start()
+
+        historyMonitor.onTrigger = { [weak self] in
+            self?.showSettings(tab: .history)
+        }
+        historyMonitor.start()
 
         controller.onStatusChange = { [weak self] status in
             self?.apply(status)
@@ -273,13 +279,20 @@ final class MenuBarController {
     }
 
     @objc private func openSettings() {
+        showSettings(tab: nil)
+    }
+
+    /// Opens the window, on `tab` when one is named — which is what the history
+    /// shortcut does. Nil leaves it on whichever tab it was last showing, so
+    /// the menu item behaves as it always has.
+    private func showSettings(tab: SettingsTab?) {
         if settingsController == nil {
             settingsController = SettingsWindowController(preferences: Preferences.shared) {
                 [weak self] in
                 self?.applyPreferences()
             }
         }
-        settingsController?.show()
+        settingsController?.show(tab: tab)
     }
 
     @objc private func openCompare() {
@@ -304,7 +317,8 @@ final class MenuBarController {
         controller.cleanupLevel = preferences.cleanupLevel
         controller.minimumHoldDuration = .milliseconds(preferences.minimumHoldMilliseconds)
         controller.handsFreeIdleTimeout = .seconds(preferences.handsFreeIdleMinutes * 60)
-        toggleMonitor.shortcut = preferences.handsFreeToggleShortcut
+        toggleMonitor.chord = preferences.handsFreeToggleChord
+        historyMonitor.chord = preferences.historyChord
         controller.formatting = preferences.formatting
         controller.handsFreeUsesTurnDetector = preferences.usesTurnDetector
         controller.turnDetectorThreshold = Float(preferences.turnDetectorThreshold)
