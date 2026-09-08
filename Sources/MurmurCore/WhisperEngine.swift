@@ -278,9 +278,15 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             // A seam is where two separate decodes meet, and only there can the
             // same words arrive twice.
             let seam = previous.map { $0.isRecovered != piece.isRecovered } ?? false
-            let text =
+            var text =
                 seam
                 ? Self.trimmingOverlap(piece.text, following: spoken.last ?? "") : piece.text
+            // Every join, not only a recovery seam: the model capitalizes the
+            // first word of each segment it emits, and it cuts a segment at
+            // every pause for thought.
+            if let preceding = spoken.last {
+                text = Self.loweringSegmentInitial(text, following: preceding)
+            }
             previous = piece
             guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
             spoken.append(text)
@@ -668,6 +674,103 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         }
         return text
     }
+
+    /// Lowercases a segment-initial word that only got its capital from being
+    /// segment-initial.
+    ///
+    /// Whisper is trained on captioned audio, where every caption line opens
+    /// with a capital, so it capitalizes the first word of **every segment it
+    /// emits** — and it cuts a segment at each pause for thought.
+    /// `finishSession` joins those segments verbatim, and `capitalizeSentences`
+    /// only ever *adds* capitals, so a pause mid-sentence arrives as a capital
+    /// mid-sentence:
+    ///
+    ///     … it's just basically like whatever There's more than one standard
+    ///     deviation from the usual Of that day Isn't it?
+    ///
+    /// Reported on large-v3-turbo, the multilingual checkpoint, which segments
+    /// far more eagerly than the `.en` models.
+    ///
+    /// **Only function words.** The capital is genuine at the start of a real
+    /// sentence and on a proper noun, and neither can be told from a stray one
+    /// by position alone — a segment opening "Sarah said that" looks exactly
+    /// like one opening "Of that day". So this moves only words that can never
+    /// be a name: one word the list does not know keeps its capital, the same
+    /// bargain `isNonSpeechAnnotation` makes. Wrongly lowercasing somebody's
+    /// name is worse than leaving a stray capital, which is only untidy.
+    public static func loweringSegmentInitial(
+        _ text: String, following previous: String
+    ) -> String {
+        // A capital after a finished sentence is correct and stays. Trailing
+        // spaces are skipped but a newline is **not** trimmed away first: a line
+        // break opens a sentence for `capitalizeSentences`, so it has to end one
+        // here too, and `.whitespacesAndNewlines` quietly ate the very character
+        // being asked about.
+        guard let ending = previous.last(where: { $0 != " " && $0 != "\t" }),
+            !sentenceTerminators.contains(ending)
+        else { return text }
+
+        guard let start = text.firstIndex(where: { !$0.isWhitespace }),
+            text[start].isUppercase
+        else { return text }
+
+        let word = text[start...].prefix { !$0.isWhitespace }
+        // An acronym is not a stray capital, and neither is a bare "I". Both
+        // have no lowercase letter after the first, which is the same test.
+        guard word.dropFirst().contains(where: \.isLowercase) else { return text }
+
+        let key = word.lowercased().filter { $0.isLetter || $0 == "\u{2019}" || $0 == "'" }
+        guard segmentInitialFunctionWords.contains(key) else { return text }
+
+        return text.replacingCharacters(
+            in: start...start, with: text[start].lowercased())
+    }
+
+    private static let sentenceTerminators: Set<Character> = [".", "!", "?", ":", ";", "\n"]
+
+    /// Words that can open a segment without opening a sentence.
+    ///
+    /// Every entry has to be a word that is **never** a proper noun and never a
+    /// deliberate capital, because this list is the only thing standing between
+    /// a stray capital and somebody's name. Nothing beginning with "i" is here:
+    /// "I", "I'm" and "I've" are capitalized because they are that word, not
+    /// because of where they fell.
+    private static let segmentInitialFunctionWords: Set<String> = [
+        // Determiners and conjunctions.
+        "the", "a", "an", "and", "but", "or", "nor", "so", "yet", "because",
+        "if", "when", "while", "whereas", "though", "although", "unless",
+        "until", "since", "whether", "that", "which", "who", "whom", "whose",
+        // Pronouns and demonstratives.
+        "this", "these", "those", "there", "they", "them", "their", "theirs",
+        "it", "its", "he", "him", "his", "she", "her", "hers", "we", "us",
+        "our", "ours", "you", "your", "yours", "me", "my", "mine", "one",
+        // Prepositions.
+        "of", "to", "for", "in", "on", "at", "by", "with", "from", "into",
+        "onto", "about", "over", "under", "as", "after", "before", "during",
+        "between", "among", "through", "against", "without", "within",
+        "across", "around", "behind", "beyond", "beside", "toward", "towards",
+        "upon", "per",
+        // Verbs that carry no meaning on their own.
+        "is", "are", "was", "were", "be", "been", "being", "am", "do", "does",
+        "did", "has", "have", "had", "can", "could", "will", "would", "shall",
+        "should", "may", "might", "must", "get", "got", "go", "going",
+        // Adverbs and fillers, which is what a pause actually resumes on.
+        "not", "no", "just", "like", "also", "even", "still", "only", "very",
+        "really", "actually", "basically", "however", "otherwise", "then",
+        "than", "too", "again", "always", "never", "maybe", "perhaps", "well",
+        "okay", "right", "now", "here", "how", "what", "why", "where", "some",
+        "any", "all", "both", "each", "every", "more", "most", "less", "least",
+        "much", "many", "such", "same", "other", "another", "own",
+        // The contractions those words actually arrive as.
+        "there's", "theres", "they're", "theyre", "they've", "theyve",
+        "it's", "its", "that's", "thats", "what's", "whats", "who's", "whos",
+        "he's", "hes", "she's", "shes", "we're", "were", "we've", "weve",
+        "you're", "youre", "you've", "youve", "isn't", "isnt", "aren't",
+        "arent", "wasn't", "wasnt", "weren't", "werent", "don't", "dont",
+        "doesn't", "doesnt", "didn't", "didnt", "can't", "cant", "won't",
+        "wont", "wouldn't", "wouldnt", "shouldn't", "shouldnt", "couldn't",
+        "couldnt", "hasn't", "hasnt", "haven't", "havent", "hadn't", "hadnt",
+    ]
 
     /// Ceiling on what an overlap may be. Long enough for the phrase a decoder
     /// stops in the middle of, short enough that it cannot swallow a sentence.

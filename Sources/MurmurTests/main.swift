@@ -2336,6 +2336,101 @@ await runner.test("an observer may read the history from the notification") {
 // dictation in that state records silence: nothing reinstalls the tap and
 // nothing starts the engine. The real device is exercised by `--testmic`.
 
+runner.suite("Segment-initial capitals")
+
+// Whisper capitalizes the first word of every segment it emits and cuts a
+// segment at every pause, so a pause mid-sentence arrives as a capital
+// mid-sentence. Reported verbatim on large-v3-turbo.
+await runner.test("a capital that only marks a pause is lowered") {
+    for (previous, next, expected) in [
+        ("like whatever", "There's more than one", "there's more than one"),
+        ("from the usual", "Of that day", "of that day"),
+        ("of that day", "Isn't it?", "isn't it?"),
+        ("we should", "Probably not", "Probably not"),
+        ("the number is", "About four", "about four"),
+    ] {
+        runner.expectEqual(
+            WhisperEngine.loweringSegmentInitial(next, following: previous), expected,
+            "\(next) after \(previous)")
+    }
+}
+
+// The list is the only thing standing between a stray capital and somebody's
+// name, so anything it does not know keeps its capital.
+await runner.test("a capital that might be a name is left alone") {
+    for (previous, next) in [
+        ("she said", "Sarah went home"),
+        ("we flew to", "Berlin last week"),
+        ("the report from", "Marketing was late"),
+        ("it uses", "Swift and Metal"),
+        ("the acronym is", "NASA in full"),
+        ("he told", "I should wait"),
+        ("and then", "I'm going home"),
+    ] {
+        runner.expectEqual(
+            WhisperEngine.loweringSegmentInitial(next, following: previous), next,
+            "\(next) after \(previous) was altered")
+    }
+}
+
+// A capital after a finished sentence is correct and must survive.
+await runner.test("a real sentence boundary keeps its capital") {
+    for previous in ["that was all.", "was it?", "stop!", "the list:", "a line\n"] {
+        runner.expectEqual(
+            WhisperEngine.loweringSegmentInitial("There's more", following: previous),
+            "There's more", "a capital after \(previous) was lowered")
+    }
+}
+
+await runner.test("leading whitespace and empty input are handled") {
+    runner.expectEqual(
+        WhisperEngine.loweringSegmentInitial(" Of that day", following: "the usual"),
+        " of that day")
+    runner.expectEqual(WhisperEngine.loweringSegmentInitial("", following: "the usual"), "")
+    runner.expectEqual(WhisperEngine.loweringSegmentInitial("Of it", following: ""), "Of it")
+}
+
+runner.suite("Latch ending")
+
+// This shipped with no test, which is how a flat two-minute cap that ended
+// long dictations mid-sentence went unexamined.
+await runner.test("a latch talked into is never ended by the clock alone") {
+    runner.expectEqual(
+        LatchEnding.decide(
+            quietFor: .seconds(2), runningFor: .seconds(600),
+            silenceTimeout: .seconds(90), ceiling: .seconds(900)),
+        .keepGoing, "ten minutes of speech was cut off")
+}
+
+await runner.test("a forgotten latch ends on silence") {
+    runner.expectEqual(
+        LatchEnding.decide(
+            quietFor: .seconds(90), runningFor: .seconds(120),
+            silenceTimeout: .seconds(90), ceiling: .seconds(900)),
+        .silence)
+}
+
+await runner.test("the ceiling still holds against continuous speech") {
+    runner.expectEqual(
+        LatchEnding.decide(
+            quietFor: .seconds(1), runningFor: .seconds(900),
+            silenceTimeout: .seconds(90), ceiling: .seconds(900)),
+        .ceiling)
+}
+
+await runner.test("a zero threshold switches that limit off") {
+    runner.expectEqual(
+        LatchEnding.decide(
+            quietFor: .seconds(3600), runningFor: .seconds(3600),
+            silenceTimeout: .zero, ceiling: .zero),
+        .keepGoing, "both limits disabled must never end a latch")
+    runner.expectEqual(
+        LatchEnding.decide(
+            quietFor: .seconds(3600), runningFor: .seconds(3600),
+            silenceTimeout: .zero, ceiling: .seconds(900)),
+        .ceiling, "the ceiling must still apply on its own")
+}
+
 runner.suite("Failed-gap subdivision")
 
 // A gap re-decoded whole is the same question the decoder already refused. The

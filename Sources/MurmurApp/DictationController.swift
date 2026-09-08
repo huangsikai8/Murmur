@@ -568,16 +568,20 @@ final class DictationController {
                     lastSpoke = ContinuousClock.now
                 }
 
-                let quiet = ContinuousClock.now - lastSpoke
-                if self.latchSilenceTimeout > .zero, quiet >= self.latchSilenceTimeout {
+                switch LatchEnding.decide(
+                    quietFor: ContinuousClock.now - lastSpoke,
+                    runningFor: ContinuousClock.now - began,
+                    silenceTimeout: self.latchSilenceTimeout,
+                    ceiling: self.maximumLatchDuration
+                ) {
+                case .keepGoing:
+                    continue
+                case .silence:
                     Log.write(
                         "latch heard no speech for \(self.latchSilenceTimeout), finalizing")
                     self.end()
                     return
-                }
-
-                let running = ContinuousClock.now - began
-                if self.maximumLatchDuration > .zero, running >= self.maximumLatchDuration {
+                case .ceiling:
                     Log.write("latch reached \(self.maximumLatchDuration), finalizing")
                     self.end()
                     return

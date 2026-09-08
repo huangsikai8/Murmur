@@ -164,6 +164,25 @@ only other recipe is to physically disconnect a headset — same reasoning as
 `WhisperEngine.forcedSampleLength`. Two tests in `Sources/MurmurTests/` assert
 the press is refused rather than queued.
 
+**A bounded lock must defer the work, not drop it.** `acquireLockOrSkip` was
+added to stop the main thread waiting forever, and in `prearm` it introduced a
+worse failure than the one it fixed — it crashes rather than hangs. `prearm` is
+what points the tap at the format the next session wants and drops a pre-roll
+recorded in the previous one. Skipping it leaves `tapInstalled` true, so
+`startLocked` does **not** re-install the tap: the device keeps delivering the
+old format with the stale roll replayed on top, and Apple's SpeechAnalyzer traps
+inside the Speech framework rather than rejecting it. The window is real, not
+theoretical — the timeout fires precisely during a configuration change, which
+is exactly when the format has most likely changed, and the lock can free
+between the pre-arm and the `start` that follows it. The pre-arm is now held in
+`prearmPending` and applied by `startLocked` under the lock it already holds; if
+that cannot take the lock either, it throws `deviceBusy` and nothing opens.
+`stop()` is the opposite call and deliberately still skips: `idle()` has already
+cleared the sink, so a close that does not happen leaves the device in the
+armed-and-idle state it sits in between dictations, and deferring it would risk
+landing on a session that has since claimed the device — silent audio for a
+whole utterance, the `sessionToken` hazard by another route.
+
 **A pre-roll captured in one format must never be replayed into a session that
 asked for another.** Hands-free re-points the armed device at 16 kHz mono and
 push-to-talk points it back; whatever the roll is holding at that moment is in
@@ -538,6 +557,20 @@ the ordering is what makes it safe, so do not move that call.
     decoder has not already refused; `subdivisionPlan` is pure and tested,
     because a plan that leaves a hole re-creates the defect and the transcript
     reads perfectly well straight across one.
+  * **Whisper capitalizes the first word of every segment, and cuts a segment at
+    every pause.** It is trained on captioned audio, where each caption line
+    opens with a capital, so a pause for thought arrives as a capital in the
+    middle of a sentence — `… like whatever There's more than one standard
+    deviation from the usual Of that day Isn't it?`. Nothing downstream undoes
+    it: `finishSession` joins segments verbatim and `capitalizeSentences` only
+    ever *adds* capitals. Reported on large-v3-turbo, the multilingual
+    checkpoint, which segments far more eagerly than the `.en` models — the same
+    speaker on small.en went ~200 holds without it, so **check which model is
+    loaded before blaming the text path**. `loweringSegmentInitial` moves it
+    back, but only for words that can never be a proper noun: a segment opening
+    "Sarah said that" is indistinguishable by position from one opening "Of that
+    day", so one word the list does not know keeps its capital. Wrongly
+    lowercasing somebody's name is worse than leaving a stray capital.
   * **A gap re-decoded from a timestamp starts where the model stopped, not
     where the phrase did**, so the two decodes overlap by a few words at the
     seam ("… The barometer in the" / "The barometer in the hallway has been

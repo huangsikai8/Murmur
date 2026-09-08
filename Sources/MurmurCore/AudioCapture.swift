@@ -182,6 +182,28 @@ public final class AudioCapture: @unchecked Sendable {
 
     private var configurationObserver: NSObjectProtocol?
 
+    /// A `prearm` that could not take the lock, held for whoever takes it next.
+    ///
+    /// Skipping a pre-arm outright is not safe, and the bug it causes is the
+    /// worst kind here — it crashes rather than hangs. `prearm` is what points
+    /// the tap at the format the next session wants and drops a pre-roll
+    /// recorded in the previous one; a skip leaves `tapInstalled` true, so
+    /// `startLocked` does *not* re-install the tap and the device keeps
+    /// delivering the old format, with the stale roll replayed on top. Apple's
+    /// SpeechAnalyzer does not reject a format it did not ask for, it traps
+    /// inside the Speech framework.
+    ///
+    /// The window is real rather than theoretical: the timeout fires precisely
+    /// during a configuration change, which is exactly when the format has most
+    /// likely actually changed, and the lock can free between the pre-arm and
+    /// the `start` that follows it. So the work is deferred, not dropped —
+    /// `startLocked` applies it under the lock it already holds, and if that
+    /// call cannot take the lock either it throws `deviceBusy` and nothing
+    /// opens at all.
+    private let pendingLock = NSLock()
+    private var prearmPending = false
+    private var prearmFormat: AVAudioFormat?
+
     /// Where a configuration change is reacted to. Serial, so a burst of them —
     /// which is what changing audio device actually produces — rebuilds the
     /// graph once at a time rather than concurrently.
@@ -284,8 +306,25 @@ public final class AudioCapture: @unchecked Sendable {
     /// 16 kHz mono where push-to-talk asks for whatever the engine wants, and a
     /// stale tap would go on delivering the previous format.
     public func prearm(targetFormat: AVAudioFormat?) {
-        guard acquireLockOrSkip(for: "pre-arming") else { return }
+        guard acquireLockOrSkip(for: "pre-arming") else {
+            // Deferred rather than dropped — see `prearmPending`.
+            pendingLock.lock()
+            prearmPending = true
+            prearmFormat = targetFormat
+            pendingLock.unlock()
+            return
+        }
         defer { lock.unlock() }
+        applyPrearmLocked(targetFormat: targetFormat)
+    }
+
+    /// The pre-arm itself, for a caller that already holds `lock`.
+    private func applyPrearmLocked(targetFormat: AVAudioFormat?) {
+        pendingLock.lock()
+        prearmPending = false
+        prearmFormat = nil
+        pendingLock.unlock()
+
         guard targetFormat != self.targetFormat || !tapInstalled else { return }
         self.targetFormat = targetFormat
         let inputFormat = engine.inputNode.outputFormat(forBus: 0)
@@ -395,6 +434,16 @@ public final class AudioCapture: @unchecked Sendable {
         // for nothing. Released rather than left to time out: the device
         // closing is the answer to their question.
         releaseDeliveryWaiters()
+        // Skipped, deliberately, and **not** deferred like `prearm` is. `idle()`
+        // above has already cleared the sink and the roll, so a close that does
+        // not happen leaves the device in exactly the armed-and-idle state it
+        // sits in between dictations: nothing is delivered anywhere, `isArmed`
+        // still answers honestly, and the only cost is an indicator lit for a
+        // dictation nobody is going to make. Deferring it would trade that for
+        // the far worse failure — a close landing on a session that has since
+        // claimed the device, which is silent audio for the whole utterance and
+        // the same shape as the `sessionToken` hazard. The next idle sweep or
+        // preference change asks again.
         guard acquireLockOrSkip(for: "closing the microphone") else { return }
         defer { lock.unlock() }
         guard isRunning else { return }
@@ -461,6 +510,19 @@ public final class AudioCapture: @unchecked Sendable {
     }
 
     private func startLocked() throws {
+        // A pre-arm that could not take the lock is applied here, before
+        // anything looks at `tapInstalled` — otherwise the tap stays pointed at
+        // the previous format and the engine is handed audio it never agreed to
+        // take. See `prearmPending`.
+        pendingLock.lock()
+        let deferredPrearm = prearmPending
+        let deferredFormat = prearmFormat
+        pendingLock.unlock()
+        if deferredPrearm {
+            diagnosticLog?("applying the pre-arm that was deferred by a busy device lock")
+            applyPrearmLocked(targetFormat: deferredFormat)
+        }
+
         // The engine is the authority on whether it is running. It stops
         // itself on a configuration change, taking the tap with it, and a
         // press that trusted the flag instead would install nothing, start
