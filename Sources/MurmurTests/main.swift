@@ -1211,7 +1211,7 @@ await runner.test("an annotation on its own carries no words") {
 runner.suite("Model catalog")
 
 await runner.test("both layers offer the expected number of models") {
-    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 18)
+    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 19)
     runner.expectEqual(ModelCatalog.models(in: .correction).count, 5)
 }
 
@@ -1233,7 +1233,9 @@ await runner.test("every Whisper variant is in the catalog exactly once") {
 
 await runner.test("every MLX Audio and Granite-MLX model is in the catalog exactly once") {
     let catalogued = ModelCatalog.models(in: .speechRecognition).map(\.id)
-    let ids = MLXAudioEngine.Variant.allCases.map(\.modelID) + [GraniteCTCEngine.modelID]
+    let ids =
+        MLXAudioEngine.Variant.allCases.map(\.modelID)
+        + GraniteCTCEngine.Variant.allCases.map(\.modelID)
     for id in ids {
         runner.expectEqual(
             catalogued.filter { $0 == id }.count, 1, "\(id) is not listed exactly once")
@@ -1259,7 +1261,21 @@ await runner.test("Granite 5.0 is stored in Murmur's folder under a named checkp
     let hub = GraniteCTCEngine.storage.hubDirectory.path
     runner.expectEqual(hub.contains("/Library/Application Support/Murmur/"), true, hub)
     runner.expectEqual(
-        GraniteCTCEngine.speechRepository, "iky1e/granite-speech-5.0-470m-turboctc-mlx-q8")
+        GraniteCTCEngine.Variant.apache.speechRepository,
+        "iky1e/granite-speech-5.0-470m-turboctc-mlx-q8")
+    runner.expectEqual(
+        GraniteCTCEngine.Variant.nonCommercial.speechRepository,
+        "iky1e/granite-speech-5.0-470m-turboctc-nc-mlx-q8")
+}
+
+// The Apache build was the only Granite 5.0 before the non-commercial one was
+// added. Its ID is what an existing download and a saved selection point at.
+await runner.test("Granite 5.0's Apache ID is unchanged, and only the nc build is labelled non-commercial") {
+    runner.expectEqual(GraniteCTCEngine.Variant.apache.modelID, "ibm.granite-speech-5.0-470m")
+    let apache = ModelCatalog.model(id: GraniteCTCEngine.Variant.apache.modelID)
+    let nc = ModelCatalog.model(id: GraniteCTCEngine.Variant.nonCommercial.modelID)
+    runner.expectEqual(apache?.license, "Apache 2.0")
+    runner.expectEqual(nc?.license.contains("non-commercial"), true)
 }
 
 await runner.test("Whisper caches inside Murmur's own folder, not Documents") {

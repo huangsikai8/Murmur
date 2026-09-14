@@ -13,13 +13,40 @@ public actor GraniteCTCEngine: SpeechRecognitionEngine {
 
     public static let engineName = "Granite-MLX"
 
-    public static let modelID = "ibm.granite-speech-5.0-470m"
+    public enum Variant: String, Sendable, CaseIterable {
+        /// Apache 2.0.
+        case apache
+        /// IBM's research and non-commercial build of the same architecture,
+        /// released under CC-BY-NC-SA-4.0: "intended for research and
+        /// non-commercial use-only". #23 on the Open ASR leaderboard of
+        /// 11 September 2026 at 5.55%, ahead of the Apache build.
+        case nonCommercial
 
-    /// The Apache 2.0 Q8 build. Spelled out rather than taken from
-    /// `GraniteModelLoader.defaultModelID`, which a package update could move to
-    /// a different checkpoint — or to one of the non-commercial builds published
-    /// beside it — without anything here changing.
-    public static let speechRepository = "iky1e/granite-speech-5.0-470m-turboctc-mlx-q8"
+        public var modelID: String {
+            switch self {
+            // Unchanged from when this was the only Granite 5.0, so an existing
+            // download and a saved selection still resolve.
+            case .apache: "ibm.granite-speech-5.0-470m"
+            case .nonCommercial: "ibm.granite-speech-5.0-470m-nc"
+            }
+        }
+
+        /// The Q8 build of each. Spelled out rather than taken from
+        /// `GraniteModelLoader.defaultModelID`, which a package update could move
+        /// to a different checkpoint without anything here changing.
+        public var speechRepository: String {
+            switch self {
+            case .apache: "iky1e/granite-speech-5.0-470m-turboctc-mlx-q8"
+            case .nonCommercial: "iky1e/granite-speech-5.0-470m-turboctc-nc-mlx-q8"
+            }
+        }
+
+        public static func from(modelID: String) -> Variant? {
+            allCases.first { $0.modelID == modelID }
+        }
+    }
+
+    /// Shared by both variants.
     public static let punctuationRepository = "iky1e/punctuation-fullstop-truecase-english-mlx-q8"
 
     /// Murmur's own folder, the same reasoning as `WhisperEngine.downloadBase`:
@@ -36,20 +63,28 @@ public actor GraniteCTCEngine: SpeechRecognitionEngine {
 
     /// Installed only when both models are: the recognizer without the
     /// formatter produces lowercase text with no punctuation.
-    public static var isInstalled: Bool {
+    public static func isInstalled(_ variant: Variant) -> Bool {
         let manager = GraniteModelManager(storage: storage)
-        return manager.isDownloaded(speechRepository, kind: .speech)
+        return manager.isDownloaded(variant.speechRepository, kind: .speech)
             && manager.isDownloaded(punctuationRepository, kind: .punctuation)
     }
 
-    public static func delete() throws {
+    /// Removes the variant's recognizer, and the shared punctuation model only
+    /// when no other variant still needs it.
+    public static func delete(_ variant: Variant) throws {
         let manager = GraniteModelManager(storage: storage)
-        for repository in [speechRepository, punctuationRepository]
-        where manager.isDownloaded(repository) {
-            try manager.remove(repository)
+        if manager.isDownloaded(variant.speechRepository) {
+            try manager.remove(variant.speechRepository)
+        }
+        let stillNeeded = Variant.allCases.contains {
+            $0 != variant && manager.isDownloaded($0.speechRepository)
+        }
+        if !stillNeeded, manager.isDownloaded(punctuationRepository) {
+            try manager.remove(punctuationRepository)
         }
     }
 
+    private let variant: Variant
     private var recognizer: GraniteRecognizer?
     private var formatter: (any GraniteTranscriptFormatter)?
 
@@ -62,7 +97,9 @@ public actor GraniteCTCEngine: SpeechRecognitionEngine {
     private let audioPipe = StreamPipe<AVAudioPCMBuffer>()
     private var feedTask: Task<Void, Never>?
 
-    public init() {}
+    public init(variant: Variant) {
+        self.variant = variant
+    }
 
     public func install(progress: (@Sendable (Double) -> Void)? = nil) async throws {
         try await prepare()
@@ -87,7 +124,8 @@ public actor GraniteCTCEngine: SpeechRecognitionEngine {
     public func prepare() async throws {
         guard recognizer == nil else { return }
         let storage = Self.storage
-        recognizer = try GraniteRecognizer(modelSource: Self.speechRepository, storage: storage)
+        recognizer = try GraniteRecognizer(
+            modelSource: variant.speechRepository, storage: storage)
         formatter = try GraniteTranscriptFormatterFactory.load(
             modelSource: Self.punctuationRepository, storage: storage)
     }
@@ -197,7 +235,7 @@ public actor GraniteCTCEngine: SpeechRecognitionEngine {
     public nonisolated(unsafe) static var diagnosticLog: (@Sendable (String) -> Void)?
 
     private func report(_ line: String) {
-        Self.diagnosticLog?("granite 5.0: \(line)")
+        Self.diagnosticLog?("granite 5.0 \(variant.rawValue): \(line)")
     }
 
     /// Publishes the one and only result, so callers that watch the stream see

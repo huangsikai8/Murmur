@@ -733,6 +733,19 @@ the ordering is what makes it safe, so do not move that call.
 through `mlx-audio-swift`; `GraniteCTCEngine` runs Granite Speech 5.0 470M and
 its punctuation model through `Granite-MLX`. Both decode on release.
 
+Granite 5.0 comes in two builds, and **only one is licensed for work use**. The
+Apache 2.0 build keeps the model ID it had when it was the only one. IBM's `-nc`
+build is CC-BY-NC-SA-4.0, "intended for research and non-commercial use-only",
+and is labelled so in the catalog; on the Open ASR leaderboard it is the more
+accurate of the two. Both share one punctuation model, which `delete` keeps
+while the other build is still installed. On the 24 `say` clips, with no
+sounds-like spellings: Apache 17 errors in 976 words, `-nc` 15. Both heard "VS
+Code" wrongly 8 times and wrote "second" as "2nd" 4 times, which the leaderboard's
+normalizer would accept, so the real difference is 5 mishearings against 3.
+`-nc` passes `--testsilence` 4 of 4. Median 86 ms per clip for `-nc` against
+179 ms for Apache, but the Apache run went first and spent 38 s on a cold load,
+so do not read the speed gap off this one run.
+
 **`mlx-swift` is pinned exactly, and the metallib must match it.** Granite-MLX
 pins `mlx-swift` 0.31.4 exactly, so Murmur and `tools/MetallibBuilder` pin it
 too. A metallib built from another version fails when a model runs, not when
@@ -930,7 +943,7 @@ text path.
 ```sh
 ./scripts/build-app.sh debug            # build + sign + assemble
 swift scripts/make-icon.swift           # regenerate the app icon (rarely needed)
-swift run MurmurTests                   # 197 tests, no Xcode needed
+swift run MurmurTests                   # 198 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --diagnose
 ./build/Murmur.app/Contents/MacOS/Murmur --selftest [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testcleanup

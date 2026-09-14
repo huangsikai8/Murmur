@@ -380,7 +380,7 @@ public enum ModelCatalog {
                 + "locally. 8-bit weights, run on the GPU."
         ),
         AIModelDescriptor(
-            id: GraniteCTCEngine.modelID,
+            id: GraniteCTCEngine.Variant.apache.modelID,
             layer: .speechRecognition,
             name: "IBM Granite Speech 5.0 470M",
             vendor: "IBM via Granite-MLX",
@@ -392,6 +392,23 @@ public enum ModelCatalog {
             summary:
                 "A small CTC recognizer from August 2026 that decodes in a single pass, with "
                 + "a separate punctuation and capitalization model. Both are included."
+        ),
+        // Measured on disk: 483 MB, plus the 57 MB punctuation model it shares
+        // with the Apache build.
+        AIModelDescriptor(
+            id: GraniteCTCEngine.Variant.nonCommercial.modelID,
+            layer: .speechRecognition,
+            name: "IBM Granite Speech 5.0 470M (non-commercial)",
+            vendor: "IBM via Granite-MLX",
+            sizeMB: 540,
+            license: "CC-BY-NC-SA-4.0 (non-commercial)",
+            streams: false,
+            runtime: .mlx,
+            punctuates: true,
+            summary:
+                "IBM's research build of the same recognizer, more accurate on the Open ASR "
+                + "leaderboard than the Apache one. Licensed for research and non-commercial "
+                + "use only."
         ),
 
         // MARK: Text cleanup
@@ -478,7 +495,9 @@ public enum ModelCatalog {
         for variant in MLXAudioEngine.Variant.allCases where MLXAudioEngine.isInstalled(variant) {
             ids.insert(variant.modelID)
         }
-        if GraniteCTCEngine.isInstalled { ids.insert(GraniteCTCEngine.modelID) }
+        for variant in GraniteCTCEngine.Variant.allCases where GraniteCTCEngine.isInstalled(variant) {
+            ids.insert(variant.modelID)
+        }
         return ids
     }
 
@@ -511,8 +530,8 @@ public enum ModelCatalog {
             try await MLXAudioEngine(variant: variant).install(progress: progress)
             return
         }
-        if descriptor.id == GraniteCTCEngine.modelID {
-            try await GraniteCTCEngine().install(progress: progress)
+        if let variant = GraniteCTCEngine.Variant.from(modelID: descriptor.id) {
+            try await GraniteCTCEngine(variant: variant).install(progress: progress)
             return
         }
         throw SpeechEngineError.unavailable("\(descriptor.name) cannot be downloaded yet.")
@@ -544,8 +563,8 @@ public enum ModelCatalog {
             try MLXAudioEngine.delete(variant)
             return
         }
-        if descriptor.id == GraniteCTCEngine.modelID {
-            try GraniteCTCEngine.delete()
+        if let variant = GraniteCTCEngine.Variant.from(modelID: descriptor.id) {
+            try GraniteCTCEngine.delete(variant)
         }
     }
 
