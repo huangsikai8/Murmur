@@ -309,6 +309,20 @@ heading still capitalizes its first real word.
 turns "$45.50 for it" into "$45.50 For it". Sentence capitalization has to check
 whether digits sit on both sides.
 
+**A spoken acronym arrives letter by letter.** Qwen3-ASR wrote "core M L" and
+"G P U memory" in real dictation. `SpokenFormatter` joins a run of two or more
+lone capital letters ("G P U" → "GPU"), first, on the recognizer's own words, so
+"G P U period" still ends as "GPU.". Punctuation after a letter ends the run, so
+"plan A. I think" survives; "plan A I think" with no punctuation becomes "plan
+AI think", which is the price, and why it has its own switch. It is on by
+default because it only removes spaces.
+
+**Adding a formatting option used to reset every saved one.** `Options` is
+stored as JSON, and the synthesized decoder throws on a missing key, so a new
+field would have made the existing saved settings unreadable. `Options` decodes
+every field with `decodeIfPresent` and its default; a test decodes JSON saved
+before a field existed.
+
 **A weak reference in the audio path is silent in every direction.**
 `StartupAudioBuffer` holds microphone buffers while the recognizer loads, and
 once `startPipeline` returns the audio tap is its only owner. Capturing it
@@ -916,7 +930,7 @@ text path.
 ```sh
 ./scripts/build-app.sh debug            # build + sign + assemble
 swift scripts/make-icon.swift           # regenerate the app icon (rarely needed)
-swift run MurmurTests                   # 194 tests, no Xcode needed
+swift run MurmurTests                   # 197 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --diagnose
 ./build/Murmur.app/Contents/MacOS/Murmur --selftest [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testcleanup

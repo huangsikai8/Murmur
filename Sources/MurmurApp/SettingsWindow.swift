@@ -382,6 +382,9 @@ private struct CleanupSettings: View {
                     $preferences.formatting.spokenPunctuation)
                 rule("Remove filler words", "“um”, “uh”", $preferences.formatting.removeFillers)
                 rule(
+                    "Join spoken letters", "“G P U” → GPU, “A I” → AI",
+                    $preferences.formatting.acronyms)
+                rule(
                     "Numbers and years", "“twenty twenty six” → 2026",
                     $preferences.formatting.numbers)
                 rule("Currency", "“five dollars” → $5", $preferences.formatting.currency)

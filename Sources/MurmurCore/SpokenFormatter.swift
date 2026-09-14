@@ -27,6 +27,8 @@ public struct SpokenFormatter {
         public var lists: Bool
         /// "heading intro" becomes "# intro".
         public var markdown: Bool
+        /// "G P U" becomes "GPU". On by default: it only removes spaces.
+        public var acronyms: Bool
 
         public init(
             enabled: Bool = true,
@@ -35,7 +37,8 @@ public struct SpokenFormatter {
             numbers: Bool = false,
             currency: Bool = false,
             lists: Bool = false,
-            markdown: Bool = false
+            markdown: Bool = false,
+            acronyms: Bool = true
         ) {
             self.enabled = enabled
             self.spokenPunctuation = spokenPunctuation
@@ -44,6 +47,32 @@ public struct SpokenFormatter {
             self.currency = currency
             self.lists = lists
             self.markdown = markdown
+            self.acronyms = acronyms
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case enabled, spokenPunctuation, removeFillers, numbers, currency, lists, markdown
+            case acronyms
+        }
+
+        /// Every field optional, falling back to its default. Options are saved
+        /// as JSON, and the synthesized decoder throws on a missing key — so a
+        /// rule added later would make every existing saved setting unreadable,
+        /// and the speaker's choices would silently reset to defaults.
+        public init(from decoder: any Decoder) throws {
+            let defaults = Options()
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            func value(_ key: CodingKeys, _ fallback: Bool) throws -> Bool {
+                try container.decodeIfPresent(Bool.self, forKey: key) ?? fallback
+            }
+            enabled = try value(.enabled, defaults.enabled)
+            spokenPunctuation = try value(.spokenPunctuation, defaults.spokenPunctuation)
+            removeFillers = try value(.removeFillers, defaults.removeFillers)
+            numbers = try value(.numbers, defaults.numbers)
+            currency = try value(.currency, defaults.currency)
+            lists = try value(.lists, defaults.lists)
+            markdown = try value(.markdown, defaults.markdown)
+            acronyms = try value(.acronyms, defaults.acronyms)
         }
     }
 
@@ -94,6 +123,9 @@ public struct SpokenFormatter {
         var tokens = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard !tokens.isEmpty else { return text }
 
+        // First, on the recognizer's own words, so "G P U period" still ends as
+        // "GPU." once spoken punctuation has run.
+        if options.acronyms { tokens = joinSpokenLetters(tokens) }
         tokens = apply(tokens, options: options)
         let joined = tokens.joined(separator: " ")
 
@@ -111,6 +143,52 @@ public struct SpokenFormatter {
     }
 
     // MARK: - Token rewriting
+
+    /// Joins a run of lone capital letters into one word: "G P U" becomes "GPU".
+    ///
+    /// Recognizers write a spoken acronym letter by letter. Qwen3-ASR did it in
+    /// real dictation — "core M L", "G P U memory" — and nothing downstream
+    /// would ever put the letters back together.
+    ///
+    /// Only capitals, only letters standing alone, and at least two of them.
+    /// Punctuation after a letter keeps its place and ends the run, so "plan
+    /// A. I think" stays two words and "the G P U," becomes "the GPU,". What
+    /// this cannot tell apart is "plan A I think" with no punctuation at all,
+    /// which becomes "plan AI think": the letter followed by the pronoun reads
+    /// exactly like the acronym.
+    private static func joinSpokenLetters(_ tokens: [String]) -> [String] {
+        var output: [String] = []
+        var index = 0
+        while index < tokens.count {
+            var letters = ""
+            var trailing = ""
+            var cursor = index
+            while cursor < tokens.count, let match = spokenLetter(tokens[cursor]) {
+                letters.append(match.letter)
+                cursor += 1
+                if !match.punctuation.isEmpty {
+                    trailing = match.punctuation
+                    break
+                }
+            }
+            if letters.count >= 2 {
+                output.append(letters + trailing)
+                index = cursor
+            } else {
+                output.append(tokens[index])
+                index += 1
+            }
+        }
+        return output
+    }
+
+    /// A lone capital letter, and whatever punctuation directly follows it.
+    private static func spokenLetter(_ token: String) -> (letter: Character, punctuation: String)? {
+        guard let first = token.first, first.isLetter, first.isUppercase else { return nil }
+        let rest = token.dropFirst()
+        guard rest.allSatisfy({ ".,;:!?".contains($0) }) else { return nil }
+        return (first, String(rest))
+    }
 
     private static func apply(_ tokens: [String], options: Options) -> [String] {
         var output: [String] = []

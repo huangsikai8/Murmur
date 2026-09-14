@@ -1759,6 +1759,47 @@ await runner.test("default formatting leaves reference sentences alone") {
     }
 }
 
+// Recognizers write a spoken acronym as separate letters — Qwen3-ASR produced
+// "core M L" and "G P U memory" in real dictation.
+await runner.test("spoken letters join into an acronym") {
+    let options = SpokenFormatter.Options()
+    runner.expectEqual(
+        SpokenFormatter.format("the G P U is fast", options: options), "The GPU is fast")
+    runner.expectEqual(
+        SpokenFormatter.format("core M L and A I", options: options), "Core ML and AI")
+    runner.expectEqual(
+        SpokenFormatter.format("is it the G P U?", options: options), "Is it the GPU?")
+    runner.expectEqual(
+        SpokenFormatter.format("ship the M V P period", options: options), "Ship the MVP.")
+}
+
+// Punctuation after a letter ends the run, and a lone capital is never joined,
+// so the pronoun and a letter that ends a sentence both survive.
+await runner.test("spoken letters leave lone capitals and punctuated letters apart") {
+    let options = SpokenFormatter.Options()
+    runner.expectEqual(
+        SpokenFormatter.format("I think A is right", options: options), "I think A is right")
+    runner.expectEqual(
+        SpokenFormatter.format("plan A. I think so", options: options), "Plan A. I think so")
+    runner.expectEqual(
+        SpokenFormatter.format("grade b c then", options: options), "Grade b c then")
+    var off = SpokenFormatter.Options()
+    off.acronyms = false
+    runner.expectEqual(
+        SpokenFormatter.format("the G P U is fast", options: off), "The G P U is fast")
+}
+
+// Options are stored as JSON. A key the saved settings predate must fall back
+// to its default, not make the whole saved configuration unreadable.
+await runner.test("formatting saved before a rule existed still loads") {
+    let saved =
+        #"{"enabled":true,"spokenPunctuation":false,"removeFillers":true,"numbers":true,"currency":false,"lists":false,"markdown":false}"#
+    let options = try? JSONDecoder().decode(SpokenFormatter.Options.self, from: Data(saved.utf8))
+    runner.expectEqual(options?.spokenPunctuation, false)
+    runner.expectEqual(options?.numbers, true)
+    runner.expectEqual(options?.acronyms, true)
+}
+
 await runner.test("the master switch turns everything off") {
     var options = SpokenFormatter.Options(enabled: false)
     options.spokenPunctuation = true
