@@ -599,6 +599,47 @@ the ordering is what makes it safe, so do not move that call.
   same audio are the same line otherwise. Not yet reproduced on a fixture:
   broadband noise at -25 dBFS does not trip it (it comes back as
   "(water running)" in 166 ms, no fallbacks), and `say` never does.
+* **WhisperKit's fallback counter undercounts, so retry figures logged before
+  2026-09-14 are low.** `totalDecodingFallbacks` is *assigned* the index of the
+  failing attempt, not incremented: a window whose first attempt was rejected
+  and second kept reports 0, and each window overwrites the one before.
+  `DecodeCost` counts retries from the temperature each kept segment was decoded
+  at, which is exact. Even undercounted, the logs showed 103 of 858 Small holds
+  retrying and 36 exhausting all five — and when every attempt is rejected
+  WhisperKit keeps the *last*, sampled at temperature 1.0.
+* **Turbo is slow because of its encoder, and the log line now says so.** Every
+  hold logs `(N window(s): mel …, encoder …, decoder … of which retries …)`.
+  Measured on `--testlong`: ~880 ms of encoder per 30-second window on Turbo
+  against ~80-90 ms on Small. Whisper encodes a full window whatever the hold's
+  length, so no Turbo hold under 3 s decoded faster than ~720 ms in the logs.
+  The 626 MB build (`openai_whisper-large-v3-v20240930_626MB`,
+  `--quantized-turbo`) decoded at the same speed with the same errors on 24
+  synthesized clips, alternated with the full build twice: ~950 MB less disk and
+  nothing else measurable. Peak RSS cannot compare them — Core ML's model memory
+  does not appear in it (110-165 MB for both).
+* **A vocabulary prompt is the one decoder change that measurably helps, and it
+  is not safe yet.** `--testwhispertuning` on 24 `say` clips (4 voices × 6
+  passages): Turbo word error 1.1% → 0.2% and vocabulary 8/16 → 16/16 — "VS Code"
+  otherwise arrives as "versus code"; Small 1.0% → 0.6%, 10/16 → 14/16. The prompt
+  never inserted its own text. But on Small's forced-stop arm of `--testlong` it
+  broke the recovery in 3 runs of 3: twice a six-word duplicate at the seam
+  ("neighbor the almanac says the tide is" twice), once "Thanks for watching."
+  Shipped settings produced neither. The likely reason, not yet tested, is that
+  a recovery decodes a short slice, and a prompt steers a short slice far harder
+  than a whole window. `DecodeTuning` keeps it test-only.
+* **The cut-off and retry settings cannot be judged on `say`.** Synthesized
+  speech produced zero retries in every arm, so removing the first-token cut-off
+  or dropping to 2 retries changed nothing measurable; only a real voice
+  exercises them. Timings between arms swung up to 2x for identical work while
+  the resident app held Turbo, so never read an arm's speed off a single run.
+* **Turbo appends "Thank you." or "you" to `--testlong` with shipped settings**
+  — 5 of 8 transcripts, never on Small or Base — and the test passes, because it
+  only fails on bracketed annotations. The fixture ends on 2.5 s of digital
+  silence; none of 20 real history entries ends in either, so it has not been
+  seen in dictation.
+* **The resampler's quality does not matter.** `AVAudioConverter` defaults to
+  64 (medium). Max (127) costs 0.030% of real time against 0.022%, and changed
+  one word in 976 on Small and none on Turbo.
 * **WhisperKit's variant folders are not a pattern.** `openai_whisper-small.en`
   next to `openai_whisper-large-v3-v20240930`, which is large-v3-turbo under its
   release date, and quantized siblings like `openai_whisper-small.en_217MB` sit
@@ -776,7 +817,7 @@ text path.
 ```sh
 ./scripts/build-app.sh debug            # build + sign + assemble
 swift scripts/make-icon.swift           # regenerate the app icon (rarely needed)
-swift run MurmurTests                   # 166 tests, no Xcode needed
+swift run MurmurTests                   # 188 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --diagnose
 ./build/Murmur.app/Contents/MacOS/Murmur --selftest [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testcleanup
@@ -792,7 +833,12 @@ swift run MurmurTests                   # 166 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --testlong [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testhomophones
 ./build/Murmur.app/Contents/MacOS/Murmur --testcompare [seconds] \
-    [--say "sentence"] [--cleanup modelID]
+    [--say "sentence" | --file clip.wav] [--cleanup modelID]
+./build/Murmur.app/Contents/MacOS/Murmur --recordclips [dir]
+./build/Murmur.app/Contents/MacOS/Murmur --testwhispertuning [dir] [modelID …] \
+    [--quantized-turbo] [--repeat N]
+./build/Murmur.app/Contents/MacOS/Murmur --whisper-tuned [cutoff,retries,prompt] \
+    --testsilence|--testlong [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --download [modelID]
 ```
 

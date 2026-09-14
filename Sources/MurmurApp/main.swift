@@ -7,6 +7,59 @@ if CommandLine.arguments.contains(where: { $0.hasPrefix("--") }) {
     setvbuf(stdout, nil, _IONBF, 0)
 }
 
+// `--whisper-tuned [cutoff,retries,prompt]` runs any test after it with the
+// candidate Whisper decoder settings instead of the shipped ones — all of them,
+// or only those listed, so a regression can be traced to the one that caused it.
+// For `--testsilence` and `--testlong`, which must still pass before a setting
+// can become the default.
+if let index = CommandLine.arguments.firstIndex(of: "--whisper-tuned") {
+    let candidate = WhisperEngine.DecodeTuning.candidate(
+        prompt: WhisperTuningTest.prompt(for: VocabularyStore.shared.phrases))
+    let listed: Set<String>? =
+        CommandLine.arguments.count > index + 1
+        && !CommandLine.arguments[index + 1].hasPrefix("--")
+        ? Set(CommandLine.arguments[index + 1].split(separator: ",").map(String.init)) : nil
+    var tuning = WhisperEngine.DecodeTuning.shipped
+    if listed?.contains("cutoff") ?? true { tuning.firstTokenCutoff = candidate.firstTokenCutoff }
+    if listed?.contains("retries") ?? true { tuning.retries = candidate.retries }
+    if listed?.contains("prompt") ?? true { tuning.prompt = candidate.prompt }
+    WhisperEngine.tuning = tuning
+    print(
+        "Whisper decoder: first-token cut-off \(tuning.firstTokenCutoff ? "on" : "off"), "
+            + "\(tuning.retries) retries, prompt "
+            + (tuning.prompt.map { "\"\($0)\"" } ?? "none") + "\n")
+}
+
+// `--recordclips [dir]` records read passages at the microphone's own rate for
+// `--testwhispertuning` to replay. Needs an interactive terminal.
+if let index = CommandLine.arguments.firstIndex(of: "--recordclips") {
+    let directory =
+        CommandLine.arguments.count > index + 1
+        && !CommandLine.arguments[index + 1].hasPrefix("--")
+        ? CommandLine.arguments[index + 1] : WhisperTuningTest.defaultDirectory
+    exit(runBlocking { await WhisperTuningTest.record(into: directory) })
+}
+
+// `--testwhispertuning [dir] [modelID …] [--quantized-turbo] [--repeat N]`
+// replays those recordings through Whisper under each decoder setting and
+// scores every transcript against the passage that was read.
+if let index = CommandLine.arguments.firstIndex(of: "--testwhispertuning") {
+    let rest = CommandLine.arguments.dropFirst(index + 1).prefix { !$0.hasPrefix("--") }
+    let directory = rest.first ?? WhisperTuningTest.defaultDirectory
+    let repeats =
+        CommandLine.arguments.firstIndex(of: "--repeat").flatMap {
+            CommandLine.arguments.count > $0 + 1 ? Int(CommandLine.arguments[$0 + 1]) : nil
+        } ?? 1
+    let modelIDs = Array(rest.dropFirst())
+    let quantizedTurbo = CommandLine.arguments.contains("--quantized-turbo")
+    exit(
+        runBlocking {
+            await WhisperTuningTest.run(
+                directory: directory, modelIDs: modelIDs, quantizedTurbo: quantizedTurbo,
+                repeats: max(1, repeats))
+        })
+}
+
 // Diagnostic modes complete before any AppKit setup, and stay synchronous on
 // purpose — see runBlocking().
 if CommandLine.arguments.contains("--diagnose") {
@@ -181,6 +234,11 @@ if let index = CommandLine.arguments.firstIndex(of: "--testcompare") {
         CommandLine.arguments.count > cleanupIndex + 1
     {
         options.cleanupModelID = CommandLine.arguments[cleanupIndex + 1]
+    }
+    if let fileIndex = CommandLine.arguments.firstIndex(of: "--file"),
+        CommandLine.arguments.count > fileIndex + 1
+    {
+        options.file = CommandLine.arguments[fileIndex + 1]
     }
     // Copied so the closure captures a value rather than the mutable local.
     let resolved = options

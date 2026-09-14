@@ -72,6 +72,9 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     }
 
     private let variant: Variant
+    /// Folder inside `argmaxinc/whisperkit-coreml` the weights come from.
+    /// `variant.repositoryFolder` everywhere in the app — see `init`.
+    private let repositoryFolder: String
     private var whisperKit: WhisperKit?
 
     /// Samples for the current utterance, at 16 kHz mono.
@@ -83,8 +86,13 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     private let audioPipe = StreamPipe<AVAudioPCMBuffer>()
     private var feedTask: Task<Void, Never>?
 
-    public init(variant: Variant) {
+    /// - Parameter repositoryFolder: a sibling build of the same checkpoint — a
+    ///   quantized one — to load in place of the variant's own folder, so
+    ///   `--testwhispertuning` can benchmark it without the catalog offering
+    ///   it. `nil` everywhere in the app.
+    public init(variant: Variant, repositoryFolder: String? = nil) {
         self.variant = variant
+        self.repositoryFolder = repositoryFolder ?? variant.repositoryFolder
     }
 
     // MARK: - Installation
@@ -107,10 +115,14 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// The folder holding one variant's compiled Core ML models. This is the
     /// layout `HubApi` writes: `<base>/models/<repo>/<folder>`.
     public static func modelsDirectory(_ variant: Variant) -> URL {
+        modelsDirectory(folder: variant.repositoryFolder)
+    }
+
+    private static func modelsDirectory(folder: String) -> URL {
         downloadBase
             .appending(path: "models", directoryHint: .isDirectory)
             .appending(path: repository, directoryHint: .isDirectory)
-            .appending(path: variant.repositoryFolder, directoryHint: .isDirectory)
+            .appending(path: folder, directoryHint: .isDirectory)
     }
 
     private static func tokenizerDirectory(_ variant: Variant) -> URL {
@@ -128,7 +140,11 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     ]
 
     public static func isInstalled(_ variant: Variant) -> Bool {
-        let models = modelsDirectory(variant)
+        isInstalled(variant, folder: variant.repositoryFolder)
+    }
+
+    private static func isInstalled(_ variant: Variant, folder: String) -> Bool {
+        let models = modelsDirectory(folder: folder)
         let complete = requiredModels.allSatisfy { name in
             FileManager.default.fileExists(atPath: models.appending(path: name).path)
         }
@@ -150,9 +166,9 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// the tokenizer arrives. That is a few hundred kilobytes, not the 1.6 GB
     /// the bar just crossed.
     public func install(progress: (@Sendable (Double) -> Void)? = nil) async throws {
-        if whisperKit == nil, !Self.isInstalled(variant) {
+        if whisperKit == nil, !Self.isInstalled(variant, folder: repositoryFolder) {
             _ = try await WhisperKit.download(
-                variant: variant.repositoryFolder,
+                variant: repositoryFolder,
                 downloadBase: Self.downloadBase,
                 from: Self.repository,
                 progressCallback: { reported in
@@ -180,7 +196,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     public func prepare() async throws {
         guard whisperKit == nil else { return }
         let configuration = WhisperKitConfig(
-            model: variant.repositoryFolder,
+            model: repositoryFolder,
             downloadBase: Self.downloadBase,
             modelRepo: Self.repository,
             tokenizerFolder: Self.downloadBase,
@@ -239,6 +255,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         let collected = samples
         samples.removeAll(keepingCapacity: true)
         let seconds = Double(collected.count) / 16000
+        Self.lastHoldCost = nil
 
         // Shorter than this is a key tap or a cough.
         guard collected.count >= 3200 else {
@@ -259,9 +276,10 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         }
 
         let decodeStart = ContinuousClock.now
-        let (pieces, recoveries, fallbacks) = try await Self.decodeWholeHold(
+        let (pieces, recoveries, cost) = try await Self.decodeWholeHold(
             collected, with: whisperKit)
         let decodeMs = Int((ContinuousClock.now - decodeStart) / .milliseconds(1))
+        Self.lastHoldCost = cost
 
         // Piece by piece rather than result by result, so a piece decoded out of
         // silence can be dropped on the evidence of its own audio. Joined with a
@@ -296,11 +314,11 @@ public actor WhisperEngine: SpeechRecognitionEngine {
 
         guard Self.carriesWords(text), !Self.isInventedSilence(text, peak: peak) else {
             report(
-                seconds: seconds, peak: peak, decodeMs: decodeMs,
+                seconds: seconds, peak: peak, decodeMs: decodeMs, cost: cost,
                 outcome: "no words in the result, nothing inserted"
                     + (invented > 0 ? " (\(invented) segment(s) decoded out of silence)" : "")
-                    + (fallbacks > 0
-                        ? " (the decoder rejected its own output \(fallbacks) time(s))" : ""))
+                    + (cost.retries > 0
+                        ? " (the decoder rejected its own output \(cost.retries) time(s))" : ""))
             finishUpdates(with: "")
             return ""
         }
@@ -311,11 +329,11 @@ public actor WhisperEngine: SpeechRecognitionEngine {
                 "decoder stopped short of the audio, \(recoveries) pass(es) recovered it")
         }
         if invented > 0 { outcome.append("\(invented) segment(s) decoded out of silence, dropped") }
-        if fallbacks > 0 {
-            outcome.append("the decoder rejected its own output \(fallbacks) time(s)")
+        if cost.retries > 0 {
+            outcome.append("the decoder rejected its own output \(cost.retries) time(s)")
         }
         report(
-            seconds: seconds, peak: peak, decodeMs: decodeMs, text: text,
+            seconds: seconds, peak: peak, decodeMs: decodeMs, cost: cost, text: text,
             outcome: outcome.isEmpty ? nil : outcome.joined(separator: "; "))
         finishUpdates(with: text)
         return text
@@ -338,17 +356,12 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// of `samples`.
     private static func decode(
         _ samples: [Float], with whisperKit: WhisperKit
-    ) async throws -> (pieces: [Piece], fallbacks: Int) {
+    ) async throws -> (pieces: [Piece], cost: DecodeCost) {
+        let options = decodeOptions(for: whisperKit)
         let results = try await whisperKit.transcribe(
-            audioArray: samples, decodeOptions: decodeOptions)
+            audioArray: samples, decodeOptions: options)
         let seconds = Double(samples.count) / sampleRate
-
-        // What the decoder thought of the audio, which is otherwise invisible.
-        // A window it has no confidence in is retried at rising temperatures and
-        // then given up on, and giving up looks exactly like a silent hold from
-        // out here — the only tell is the time, because every retry is another
-        // full decode.
-        let fallbacks = Int(results.reduce(0) { $0 + $1.timings.totalDecodingFallbacks })
+        let cost = DecodeCost(results, options: options)
 
         var pieces: [Piece] = []
         for result in results {
@@ -367,7 +380,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
                         text: segment.text))
             }
         }
-        return (pieces, fallbacks)
+        return (pieces, cost)
     }
 
     /// Decodes the hold, re-decoding whatever audible audio the transcript does
@@ -398,8 +411,8 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// reasons cannot be asked the same question twice.
     private static func decodeWholeHold(
         _ samples: [Float], with whisperKit: WhisperKit
-    ) async throws -> (pieces: [Piece], recoveries: Int, fallbacks: Int) {
-        var (pieces, fallbacks) = try await decode(samples, with: whisperKit)
+    ) async throws -> (pieces: [Piece], recoveries: Int, cost: DecodeCost) {
+        var (pieces, cost) = try await decode(samples, with: whisperKit)
         var floor: Double = 0
         var recoveries = 0
         let budget = maxRecoveryPasses(forSeconds: Double(samples.count) / sampleRate)
@@ -412,7 +425,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             let slice = span(samples, from: gap.start, to: gap.end)
             let pass = try await decodeGap(
                 samples, from: gap.start, to: gap.end, with: whisperKit)
-            fallbacks += pass.fallbacks
+            cost.add(pass.cost)
             let recovered = pass.pieces
             let text = TextNormalizer.finalize(
                 stripNonSpeechAnnotations(recovered.map(\.text).joined(separator: " ")))
@@ -441,7 +454,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         // middle is found after the text that follows it. The transcript is read
         // in the order it was spoken.
         pieces.sort { ($0.start, $0.end) < ($1.start, $1.end) }
-        return (pieces, recoveries, fallbacks)
+        return (pieces, recoveries, cost)
     }
 
     /// Decodes one gap, and if that produces nothing, decodes it in pieces.
@@ -467,25 +480,25 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// never happens.
     private static func decodeGap(
         _ samples: [Float], from start: Double, to end: Double, with whisperKit: WhisperKit
-    ) async throws -> (pieces: [Piece], fallbacks: Int) {
+    ) async throws -> (pieces: [Piece], cost: DecodeCost) {
         let whole = span(samples, from: start, to: end)
         let first = try await decode(whole, with: whisperKit)
-        var fallbacks = first.fallbacks
+        var cost = first.cost
         if carriesUsableWords(first.pieces, decodedFrom: whole) {
-            return (recovered(first.pieces, offsetBy: start), fallbacks)
+            return (recovered(first.pieces, offsetBy: start), cost)
         }
 
         // Short gaps are left alone. Below this the slice was never the problem,
         // and cutting it further only feeds the decoder more silence, which is
         // what it answers with words nobody said.
-        guard end - start > subdivisionThreshold else { return ([], fallbacks) }
+        guard end - start > subdivisionThreshold else { return ([], cost) }
 
         var collected: [Piece] = []
         var emittedThrough = start
         for chunk in subdivisionPlan(from: start, to: end) {
             let audio = span(samples, from: chunk.from, to: chunk.to)
             let pass = try await decode(audio, with: whisperKit)
-            fallbacks += pass.fallbacks
+            cost.add(pass.cost)
             guard carriesUsableWords(pass.pieces, decodedFrom: audio) else {
                 emittedThrough = chunk.to
                 continue
@@ -498,7 +511,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             }
             emittedThrough = chunk.to
         }
-        return (collected, fallbacks)
+        return (collected, cost)
     }
 
     /// How a failed gap is cut up, as spans in seconds from the start of the
@@ -840,13 +853,18 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// dictation runs at 2-3, and the failure being watched for here reads as
     /// 0.1-0.6 against a hold long enough to be a paragraph.
     private func report(
-        seconds: Double, peak: Float?, decodeMs: Int? = nil, text: String? = nil,
-        outcome: String? = nil
+        seconds: Double, peak: Float?, decodeMs: Int? = nil, cost: DecodeCost? = nil,
+        text: String? = nil, outcome: String? = nil
     ) {
         guard let log = Self.diagnosticLog else { return }
-        var line = String(format: "whisper %@: %.1f s audio", variant.rawValue, seconds)
+        // A benchmarked sibling build is named by its folder, or its line would
+        // read exactly like the variant it is being compared against.
+        let name =
+            repositoryFolder == variant.repositoryFolder ? variant.rawValue : repositoryFolder
+        var line = String(format: "whisper %@: %.1f s audio", name, seconds)
         if let peak { line += String(format: ", peak %.1f dBFS", peak) }
         if let decodeMs { line += ", decoded in \(decodeMs) ms" }
+        if let cost { line += " (\(cost.summary))" }
         if let text {
             let words = text.split(whereSeparator: \.isWhitespace).count
             line += String(
@@ -863,7 +881,122 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// timestamp, so turning them off looks free and costs a clause at every
     /// 30-second boundary — with no error, no warning, and a transcript that
     /// reads perfectly well right across the gap.
-    public static var decodesWithTimestamps: Bool { !decodeOptions.withoutTimestamps }
+    public static var decodesWithTimestamps: Bool { !baseDecodeOptions.withoutTimestamps }
+
+    /// Where one hold's decode time went, summed over every WhisperKit call the
+    /// hold needed — the first pass and each recovery.
+    ///
+    /// "Decoded in N ms" cannot say whether a slow hold was the model's size or
+    /// the decoder distrusting itself, and those have different fixes. Whisper
+    /// encodes a fixed 30-second window whatever the recording's length, so the
+    /// encoder is a floor paid per window; a retry is a whole extra decode, paid
+    /// only when an attempt is rejected.
+    public struct DecodeCost: Sendable, Equatable {
+        /// 30-second windows encoded, across every call.
+        public var windows = 0
+        public var melSeconds: Double = 0
+        public var encoderSeconds: Double = 0
+        /// The rest of the decode loop: token prediction, sampling, the KV cache
+        /// and windowing. Includes `retrySeconds`.
+        public var decoderSeconds: Double = 0
+        /// The part of `decoderSeconds` spent on attempts that were thrown away.
+        public var retrySeconds: Double = 0
+        /// Attempts thrown away and decoded again at a higher temperature.
+        public var retries = 0
+
+        public init() {}
+
+        /// **WhisperKit's own fallback counter cannot be summed.**
+        /// `totalDecodingFallbacks` is *assigned* the index of the attempt that
+        /// failed, not incremented, so a window whose first attempt was rejected
+        /// and whose second was kept reports 0 — and each window overwrites the
+        /// one before. Every retry raises the temperature by a fixed step, so the
+        /// temperature the kept segment was decoded at is the exact count. The
+        /// counter is kept only as a floor, for a window that kept no segment to
+        /// read a temperature from.
+        init(_ results: [TranscriptionResult], options: DecodingOptions) {
+            let step = Double(options.temperatureIncrementOnFallback)
+            for result in results {
+                let timings = result.timings
+                windows += Int(timings.totalEncodingRuns)
+                melSeconds += timings.logmels
+                encoderSeconds += timings.encoding
+                decoderSeconds += max(0, timings.decodingLoop - timings.logmels - timings.encoding)
+                retrySeconds += timings.decodingFallback
+
+                var temperatureByWindow: [Int: Float] = [:]
+                for segment in result.segments {
+                    temperatureByWindow[segment.seek] = max(
+                        temperatureByWindow[segment.seek] ?? 0, segment.temperature)
+                }
+                let counted =
+                    step > 0
+                    ? temperatureByWindow.values.reduce(0) {
+                        $0 + Int(((Double($1) - Double(options.temperature)) / step).rounded())
+                    } : 0
+                retries += max(counted, Int(timings.totalDecodingFallbacks))
+            }
+        }
+
+        public mutating func add(_ other: DecodeCost) {
+            windows += other.windows
+            melSeconds += other.melSeconds
+            encoderSeconds += other.encoderSeconds
+            decoderSeconds += other.decoderSeconds
+            retrySeconds += other.retrySeconds
+            retries += other.retries
+        }
+
+        /// The breakdown as `Murmur.log` prints it.
+        public var summary: String {
+            let ms = { (seconds: Double) in Int((seconds * 1000).rounded()) }
+            var text =
+                "\(windows) window(s): mel \(ms(melSeconds)) ms, encoder \(ms(encoderSeconds)) ms, "
+                + "decoder \(ms(decoderSeconds)) ms"
+            if retries > 0 || retrySeconds > 0 {
+                text += " of which \(retries) retry(s) \(ms(retrySeconds)) ms"
+            }
+            return text
+        }
+    }
+
+    /// The most recent hold's cost, for a test to read without parsing the log
+    /// line. `nil` for a hold that was never decoded.
+    public nonisolated(unsafe) static var lastHoldCost: DecodeCost?
+
+    /// How far the decoder may distrust itself, and what it is told to expect.
+    ///
+    /// **Test-only: `.shipped` in the app.** It exists so `--testwhispertuning`
+    /// can measure each change against the same recordings before any of them
+    /// becomes the default.
+    public struct DecodeTuning: Sendable, Equatable {
+        /// WhisperKit's `firstTokenLogProbThreshold` of -1.5, which OpenAI's
+        /// reference decoder does not have. An attempt whose first token falls
+        /// below it ends with no tokens at all and is retried.
+        public var firstTokenCutoff: Bool
+        /// `temperatureFallbackCount`. When every attempt is rejected WhisperKit
+        /// keeps the *last* one, which is the most random of them.
+        public var retries: Int
+        /// Text the decoder is conditioned on as if it had just been said, which
+        /// is how Whisper is biased towards a spelling.
+        public var prompt: String?
+
+        public init(firstTokenCutoff: Bool, retries: Int, prompt: String?) {
+            self.firstTokenCutoff = firstTokenCutoff
+            self.retries = retries
+            self.prompt = prompt
+        }
+
+        /// WhisperKit's defaults, which is what the app has always run.
+        public static let shipped = DecodeTuning(firstTokenCutoff: true, retries: 5, prompt: nil)
+
+        /// Every change under test at once.
+        public static func candidate(prompt: String?) -> DecodeTuning {
+            DecodeTuning(firstTokenCutoff: false, retries: 2, prompt: prompt)
+        }
+    }
+
+    public nonisolated(unsafe) static var tuning = DecodeTuning.shipped
 
     // MARK: - Non-speech annotations
 
@@ -873,7 +1006,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// These are ordinary text tokens, not special tokens, so `skipSpecialTokens`
     /// does not touch them and they are inserted into the speaker's document
     /// like anything else. They appear once timestamps are on — which they must
-    /// be, see `decodeOptions` — most often as a trailing marker on a hold that
+    /// be, see `baseDecodeOptions` — most often as a trailing marker on a hold that
     /// ended in silence.
     ///
     /// Matched on the *whole* bracketed span against a fixed list, never on the
@@ -1140,14 +1273,30 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// this mode — see `stripNonSpeechAnnotations`. Losing words the speaker
     /// said is the worse failure of the two, and the annotations are
     /// recognizable enough to remove exactly.
-    private static var decodeOptions: DecodingOptions {
-        var options = DecodingOptions(
+    private static var baseDecodeOptions: DecodingOptions {
+        DecodingOptions(
             task: .transcribe,
             language: "en",
             detectLanguage: false,
             skipSpecialTokens: true,
             withoutTimestamps: false
         )
+    }
+
+    /// `baseDecodeOptions` with the current `tuning` and any test cap applied.
+    /// Built per decode rather than once, because both can change between holds
+    /// and the prompt has to be tokenized by the model that will read it.
+    private static func decodeOptions(for whisperKit: WhisperKit) -> DecodingOptions {
+        var options = baseDecodeOptions
+        let tuning = tuning
+        if !tuning.firstTokenCutoff { options.firstTokenLogProbThreshold = nil }
+        options.temperatureFallbackCount = tuning.retries
+        if let prompt = tuning.prompt, let tokenizer = whisperKit.tokenizer {
+            // Leading space: BPE gives a word a different token with and without
+            // the space before it, and the terms arrive mid-sentence.
+            options.promptTokens = tokenizer.encode(text: " " + prompt)
+                .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+        }
         if let forcedSampleLength { options.sampleLength = forcedSampleLength }
         return options
     }

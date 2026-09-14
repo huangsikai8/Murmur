@@ -1242,6 +1242,48 @@ await runner.test("Whisper caches inside Murmur's own folder, not Documents") {
         "openai_whisper-large-v3-v20240930")
 }
 
+// Word error rate decides between Whisper decoder settings, so a scorer that
+// counts wrongly picks the wrong setting and reports it as measured.
+await runner.test("word error rate counts substitutions, insertions and deletions") {
+    let exact = WordErrorRate.measure(
+        reference: "Open VS Code, then ask Claude.", hypothesis: "open vs code then ask claude")
+    runner.expectEqual(exact.errors, 0)
+    runner.expectEqual(exact.referenceWords, 6)
+
+    let misheard = WordErrorRate.measure(
+        reference: "ask Claude to review it", hypothesis: "ask cloud to review it")
+    runner.expectEqual(misheard.errors, 1)
+    runner.expectEqual(misheard.marked, "ask ⟨claude→cloud⟩ to review it")
+
+    let dropped = WordErrorRate.measure(
+        reference: "check the build before we merge", hypothesis: "check the build")
+    runner.expectEqual(dropped.errors, 3)
+    runner.expectEqual(dropped.marked, "check the build ⟨−before⟩ ⟨−we⟩ ⟨−merge⟩")
+
+    let invented = WordErrorRate.measure(reference: "merge it", hypothesis: "merge it thank you")
+    runner.expectEqual(invented.errors, 2)
+    runner.expectEqual(invented.marked, "merge it ⟨+thank⟩ ⟨+you⟩")
+
+    runner.expectEqual(WordErrorRate.measure(reference: "one two", hypothesis: "").errors, 2)
+    runner.expectEqual(WordErrorRate.measure(reference: "", hypothesis: "").errors, 0)
+}
+
+await runner.test("vocabulary occurrences match whole words, ignoring case and punctuation") {
+    runner.expectEqual(
+        WordErrorRate.occurrences(of: "VS Code", in: "Open VS code, then vs-code again."), 2)
+    runner.expectEqual(WordErrorRate.occurrences(of: "VS Code", in: "VSCode"), 0)
+    runner.expectEqual(WordErrorRate.occurrences(of: "Claude", in: "Claudette and Claude"), 1)
+}
+
+// The decoder settings `--testwhispertuning` varies are test-only until one is
+// chosen. A tuning left switched on would change every dictation silently.
+await runner.test("the app decodes with WhisperKit's default fallback settings") {
+    runner.expectEqual(WhisperEngine.tuning, .shipped)
+    runner.expectEqual(WhisperEngine.DecodeTuning.shipped.firstTokenCutoff, true)
+    runner.expectEqual(WhisperEngine.DecodeTuning.shipped.retries, 5)
+    runner.expectEqual(WhisperEngine.DecodeTuning.shipped.prompt, nil)
+}
+
 await runner.test("each speech model's streaming claim matches its engine") {
     // Murmur used to list streaming models only. Non-streaming ones are now
     // allowed, so the invariant is no longer "everything streams" but "the

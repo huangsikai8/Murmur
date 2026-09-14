@@ -18,6 +18,9 @@ enum CompareTest {
         /// microphone. Makes a run repeatable, and lets the command be
         /// verified where no one can speak into a mic.
         var sentence: String?
+        /// Replay a saved recording — `--recordclips` writes them — instead of
+        /// opening the microphone, so the same take can be compared again.
+        var file: String?
         /// Run every bubble's transcript through this cleanup model too.
         var cleanupModelID: String?
         var cleanupLevel: CleanupLevel = .light
@@ -42,7 +45,9 @@ enum CompareTest {
         let recording: ModelComparison.Recording
         do {
             recording =
-                if let sentence = options.sentence {
+                if let file = options.file {
+                    try loaded(file)
+                } else if let sentence = options.sentence {
                     try synthesized(sentence)
                 } else {
                     try await recorded(seconds: options.seconds)
@@ -200,6 +205,16 @@ enum CompareTest {
         capture.stop()
 
         return buffer.recording()
+    }
+
+    /// Reads a saved recording and resamples it to 16 kHz the way the microphone
+    /// tap does, at the converter's default quality.
+    private static func loaded(_ path: String) throws -> ModelComparison.Recording {
+        print("  replaying \((path as NSString).lastPathComponent)")
+        let audio = try WhisperTuningTest.readMono(
+            URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+        return ModelComparison.Recording(
+            samples: WhisperTuningTest.resample(audio.samples, from: audio.sampleRate, quality: nil))
     }
 
     /// Renders a sentence with `say` and reads it back as samples.
