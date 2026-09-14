@@ -713,6 +713,70 @@ the ordering is what makes it safe, so do not move that call.
 * **Install detection must match exact cache folders.** Matching loosely on
   "parakeet" once reported an unrelated model as installed.
 
+## Non-Whisper batch engines on MLX (Cohere, Granite)
+
+`MLXAudioEngine` runs Cohere Transcribe 2B and IBM Granite Speech 4.1 2B
+through `mlx-audio-swift`; `GraniteCTCEngine` runs Granite Speech 5.0 470M and
+its punctuation model through `Granite-MLX`. Both decode on release.
+
+**`mlx-swift` is pinned exactly, and the metallib must match it.** Granite-MLX
+pins `mlx-swift` 0.31.4 exactly, so Murmur and `tools/MetallibBuilder` pin it
+too. A metallib built from another version fails when a model runs, not when
+the app builds, so `build-app.sh` stamps the version it built from and rebuilds
+when `Package.resolved` disagrees.
+
+**Every one of these answers silence with words.** `--testsilence` before the
+guard: Cohere returned "Thank you." for 3 silent holds of 4, Granite 5.0 "Thank
+you." or "I." for 4 of 4. Granite 4.1 and Distil-Whisper returned nothing. The
+guard that already protected Whisper — a -45 dBFS peak ceiling below which
+nothing is decoded, and stock fillers dropped on quiet holds — now lives in
+`SilenceGuard` and runs in all three engines; Cohere and Granite 5.0 then pass
+4 of 4.
+
+**Granite reads `language` as a translation target.** An English hint asks it
+to translate, so it is given none. MLX Audio's default prompt is IBM's
+raw-transcript one, and IBM's keyword-biasing prompt is raw too, so the engine
+sends IBM's punctuation prompt and no keywords.
+
+**Cohere's Swift loaders are internal.** `CohereTranscribeModel.fromPretrained`
+and `fromDirectory` are not public at 0.1.3 or on `main`;
+`STT.loadModel(modelRepo:modelType:)` is the only way in, and it ignores any
+cache it is given, which is why every MLX Audio variant uses the default hub
+cache for install detection.
+
+**Every MLX Audio checkpoint is downloaded twice.** The hub keeps the weights in
+`models--<owner>--<name>/blobs`, and MLX Audio copies them — a real copy, not a
+link — into `mlx-audio/<owner>_<name>`, the only folder it loads from or checks.
+Measured: 2307 MB in each for Cohere, 3149 MB in each for Granite 4.1.
+`install()` removes the hub's copy once the load succeeds.
+
+**A released MLX model stays resident.** Dropping the model hands its buffers to
+MLX's cache, not the system: the app with Cohere's 2.3 GB weights selected held
+4.7 GB of GPU memory, and a relaunch took it back to 2.3 GB. In one
+`--testmodels` process, Granite 5.0 peaked at 3.9 GB after Cohere had been
+released. Both engines call `Memory.clearCache()` in `releaseModels()`, and
+`install()` releases the model it loaded to verify the download. Measured
+after the fix, same order in one process: Granite 5.0 peaked at 1002 MB.
+
+**On `say` clips the leaderboard models tie or beat Turbo, once the vocabulary
+is applied to all of them.** `--testmodels` on 24 clips, scored after
+`VocabularyNormalizer` as the app delivers text, with "versus code" and "verses
+code" given as sounds-like spellings of "VS Code" for the run:
+
+| | word error | vocabulary | median per clip | peak footprint |
+| --- | --- | --- | --- | --- |
+| Whisper Large v3 Turbo (prompted) | 0.2% | 16/16 | 1103 ms | 205 MB* |
+| Cohere Transcribe 2B | 0.2% | 16/16 | **463 ms** | 3138 MB |
+| Granite Speech 5.0 470M | 1.1% | 14/16 | **83 ms** | see above |
+
+\* Core ML on the Neural Engine is not counted in the footprint; MLX on the GPU
+is. Without the sounds-like spellings every non-Whisper model heard "VS Code"
+as "versus code" or "verses code", which is what made them look worse in the
+first run. Granite 4.1 had no errors outside that word but took a median
+6.8 s per clip at 4.2 GB; Distil-Whisper was barely faster than Turbo and less
+accurate. A first run with Granite 4.1 loaded measured Cohere at 1212 ms
+median, so read these speeds as sensitive to memory pressure on a 16 GB machine.
+
 ## Turn detection (smart-turn v3)
 
 Silence duration is a proxy for "they are finished", and a bad one — people
@@ -832,7 +896,7 @@ text path.
 ```sh
 ./scripts/build-app.sh debug            # build + sign + assemble
 swift scripts/make-icon.swift           # regenerate the app icon (rarely needed)
-swift run MurmurTests                   # 188 tests, no Xcode needed
+swift run MurmurTests                   # 194 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --diagnose
 ./build/Murmur.app/Contents/MacOS/Murmur --selftest [modelID]
 ./build/Murmur.app/Contents/MacOS/Murmur --testcleanup
@@ -852,8 +916,10 @@ swift run MurmurTests                   # 188 tests, no Xcode needed
 ./build/Murmur.app/Contents/MacOS/Murmur --recordclips [dir]
 ./build/Murmur.app/Contents/MacOS/Murmur --testwhispertuning [dir] [modelID …] \
     [--quantized-turbo] [--repeat N]
-./build/Murmur.app/Contents/MacOS/Murmur --whisper-tuned [cutoff,retries,prompt] \
+./build/Murmur.app/Contents/MacOS/Murmur --whisper-tuned [cutoff,retries,prompt|noprompt] \
     --testsilence|--testlong [modelID]
+./build/Murmur.app/Contents/MacOS/Murmur --testmodels [dir] modelID … \
+    [--sounds-like "VS Code=versus code|verses code"]
 ./build/Murmur.app/Contents/MacOS/Murmur --download [modelID]
 ```
 

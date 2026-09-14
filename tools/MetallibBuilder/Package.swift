@@ -9,7 +9,7 @@ let package = Package(
     name: "MetallibBuilder",
     platforms: [.macOS("26.0")],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.4")
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4")
     ],
     targets: [
         .executableTarget(

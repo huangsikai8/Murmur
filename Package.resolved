@@ -1,5 +1,5 @@
 {
-  "originHash" : "1cd7ca9c9bffc312dd9c31e5089510a88564f70b74528ccd7d77f8c281086eaa",
+  "originHash" : "833977dce31c91a7c6fbd283a8607ddcd5cbf542ef216cef9e9c0234261a1b66",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -20,12 +20,30 @@
       }
     },
     {
+      "identity" : "granite-mlx",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/kylehowells/Granite-MLX",
+      "state" : {
+        "revision" : "cdda6bd23b72e5144a1b90d55100759da743f7da",
+        "version" : "0.1.1"
+      }
+    },
+    {
+      "identity" : "mlx-audio-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Blaizzy/mlx-audio-swift",
+      "state" : {
+        "revision" : "d302a5c6080d2bb97bae38c7418f82abb76013b6",
+        "version" : "0.1.3"
+      }
+    },
+    {
       "identity" : "mlx-swift",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift",
       "state" : {
-        "revision" : "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
-        "version" : "0.31.6"
+        "revision" : "dc43e62d7055353c7f99fa071a4e71d29dfddc44",
+        "version" : "0.31.4"
       }
     },
     {

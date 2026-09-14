@@ -46,6 +46,36 @@ if let index = CommandLine.arguments.firstIndex(of: "--recordclips") {
     exit(runBlocking { await WhisperTuningTest.record(into: directory) })
 }
 
+// `--testmodels [dir] modelID …` scores those recordings through any speech
+// models, with load time and peak memory, to compare engines rather than
+// settings. A first argument containing "/" is the folder.
+if let index = CommandLine.arguments.firstIndex(of: "--testmodels") {
+    let rest = Array(CommandLine.arguments.dropFirst(index + 1).prefix { !$0.hasPrefix("--") })
+    let directory = rest.first.flatMap { $0.contains("/") ? $0 : nil }
+    let modelIDs = directory == nil ? rest : Array(rest.dropFirst())
+    // `--sounds-like "VS Code=versus code|verses code;Claude=clawed"` adds
+    // sounds-like spellings for this run only, without touching the saved
+    // vocabulary, to see what a change to it would do.
+    var extraSoundsLike: [String: [String]] = [:]
+    if let flag = CommandLine.arguments.firstIndex(of: "--sounds-like"),
+        CommandLine.arguments.count > flag + 1
+    {
+        for pair in CommandLine.arguments[flag + 1].split(separator: ";") {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            extraSoundsLike[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1]
+                .split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+    }
+    let resolvedSoundsLike = extraSoundsLike
+    exit(
+        runBlocking {
+            await WhisperTuningTest.runModels(
+                directory: directory ?? WhisperTuningTest.defaultDirectory, modelIDs: modelIDs,
+                extraSoundsLike: resolvedSoundsLike)
+        })
+}
+
 // `--testwhispertuning [dir] [modelID …] [--quantized-turbo] [--repeat N]`
 // replays those recordings through Whisper under each decoder setting and
 // scores every transcript against the passage that was read.

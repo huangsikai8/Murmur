@@ -55,6 +55,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // was handed, so a hold that comes back far shorter than it was spoken
         // is indistinguishable from a hold in which little was said.
         WhisperEngine.diagnosticLog = { Log.write($0) }
+        MLXAudioEngine.diagnosticLog = { Log.write($0) }
+        GraniteCTCEngine.diagnosticLog = { Log.write($0) }
         ModelCatalog.coreMLEngineWired = true
         // MLX is compiled in, so the downloadable language models may be offered.
         ModelCatalog.mlxSupported = true

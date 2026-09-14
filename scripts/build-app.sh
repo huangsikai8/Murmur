@@ -34,6 +34,19 @@ METALLIB_PKG="$ROOT/tools/MetallibBuilder"
 METALLIB_DD="$METALLIB_PKG/.build-xc"
 MLX_BUNDLE="$METALLIB_DD/Build/Products/Debug/mlx-swift_Cmlx.bundle"
 
+# The metallib has to come from the mlx-swift the app links, and a mismatch
+# fails when a model runs, not when this builds. So the cache is keyed on the
+# version: a bundle built for any other one is thrown away.
+mlx_version() {
+    python3 -c "import json,sys; print(next(p['state'].get('version') or p['state']['revision'] for p in json.load(open(sys.argv[1]))['pins'] if p['identity'] == 'mlx-swift'))" "$1" 2>/dev/null
+}
+MLX_VERSION="$(mlx_version "$ROOT/Package.resolved")"
+MLX_STAMP="$METALLIB_DD/mlx-swift-version"
+if [ -d "$MLX_BUNDLE" ] && [ "$(cat "$MLX_STAMP" 2>/dev/null)" != "$MLX_VERSION" ]; then
+    echo "    app links mlx-swift $MLX_VERSION; rebuilding metallib"
+    rm -rf "$METALLIB_DD"
+fi
+
 if [ ! -d "$MLX_BUNDLE" ]; then
     (cd "$METALLIB_PKG" && xcodebuild \
         -scheme MetallibBuilder \
@@ -48,6 +61,15 @@ if [ ! -d "$MLX_BUNDLE" ]; then
         }
 else
     echo "    reusing cached metallib"
+fi
+if [ -d "$MLX_BUNDLE" ]; then
+    BUILT_VERSION="$(mlx_version "$METALLIB_PKG/Package.resolved")"
+    if [ "$BUILT_VERSION" != "$MLX_VERSION" ]; then
+        echo "    warning: metallib built from mlx-swift $BUILT_VERSION, app links $MLX_VERSION;" >&2
+        echo "    pin both to the same version or MLX models fail at runtime." >&2
+    else
+        echo "$MLX_VERSION" > "$MLX_STAMP"
+    fi
 fi
 
 echo "==> Assembling $APP"

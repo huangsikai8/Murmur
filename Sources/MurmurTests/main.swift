@@ -1211,7 +1211,7 @@ await runner.test("an annotation on its own carries no words") {
 runner.suite("Model catalog")
 
 await runner.test("both layers offer the expected number of models") {
-    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 13)
+    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 17)
     runner.expectEqual(ModelCatalog.models(in: .correction).count, 5)
 }
 
@@ -1229,6 +1229,36 @@ await runner.test("every Whisper variant is in the catalog exactly once") {
             WhisperEngine.Variant.from(modelID: variant.modelID), variant,
             "\(variant.modelID) does not resolve back to its variant")
     }
+}
+
+await runner.test("every MLX Audio and Granite-MLX model is in the catalog exactly once") {
+    let catalogued = ModelCatalog.models(in: .speechRecognition).map(\.id)
+    let ids = MLXAudioEngine.Variant.allCases.map(\.modelID) + [GraniteCTCEngine.modelID]
+    for id in ids {
+        runner.expectEqual(
+            catalogued.filter { $0 == id }.count, 1, "\(id) is not listed exactly once")
+    }
+    for variant in MLXAudioEngine.Variant.allCases {
+        runner.expectEqual(
+            MLXAudioEngine.Variant.from(modelID: variant.modelID), variant,
+            "\(variant.modelID) does not resolve back to its variant")
+    }
+}
+
+// Granite Speech reads `language` as the language to translate into, so an
+// English hint turns a transcription request into a translation request.
+await runner.test("Granite Speech 4.1 is never handed a language hint") {
+    runner.expectEqual(MLXAudioEngine.Variant.graniteSpeech41.languageHint, nil)
+    runner.expectEqual(MLXAudioEngine.Variant.cohereTranscribe.languageHint, "en")
+}
+
+// Granite-MLX's own default is ~/Documents/huggingface, and a checkpoint named
+// by the package's default could change underneath this app on an update.
+await runner.test("Granite 5.0 is stored in Murmur's folder under a named checkpoint") {
+    let hub = GraniteCTCEngine.storage.hubDirectory.path
+    runner.expectEqual(hub.contains("/Library/Application Support/Murmur/"), true, hub)
+    runner.expectEqual(
+        GraniteCTCEngine.speechRepository, "iky1e/granite-speech-5.0-470m-turboctc-mlx-q8")
 }
 
 await runner.test("Whisper caches inside Murmur's own folder, not Documents") {
@@ -1440,11 +1470,14 @@ await runner.test("every non-Apple catalog model maps to a real engine") {
             "\(model.name) claims Moonshine but has no engine"
         )
     }
+    // MLX runs both cleanup models and, through MLX Audio and Granite-MLX,
+    // speech models, so which engine is owed depends on the layer.
     for model in ModelCatalog.all where model.runtime == .mlx {
-        runner.expect(
-            MLXCleaner.Variant.from(modelID: model.id) != nil,
-            "\(model.name) claims MLX but has no engine"
-        )
+        let hasEngine =
+            model.layer == .speechRecognition
+            ? SpeechEngineFactory.engine(for: model.id) != nil
+            : MLXCleaner.Variant.from(modelID: model.id) != nil
+        runner.expect(hasEngine, "\(model.name) claims MLX but has no engine")
     }
 }
 

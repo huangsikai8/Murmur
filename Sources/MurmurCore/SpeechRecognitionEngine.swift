@@ -121,6 +121,10 @@ public enum SpeechEngineFactory {
         if let variant = WhisperEngine.Variant.from(modelID: modelID) {
             return WhisperEngine(variant: variant)
         }
+        if let variant = MLXAudioEngine.Variant.from(modelID: modelID) {
+            return MLXAudioEngine(variant: variant)
+        }
+        if modelID == GraniteCTCEngine.modelID { return GraniteCTCEngine() }
         return nil
     }
 

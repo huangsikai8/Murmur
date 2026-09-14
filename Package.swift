@@ -19,6 +19,16 @@ let package = Package(
         // Whisper on Core ML. Pure Swift with no binary targets, so it does not
         // hit the duplicate `module.modulemap` that keeps this build on SwiftPM.
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.1.0"),
+        // Speech models on MLX: Cohere Transcribe and IBM Granite Speech 4.1.
+        // MIT. It carries no Metal sources of its own, so the metallib built by
+        // tools/MetallibBuilder is all it needs.
+        .package(url: "https://github.com/Blaizzy/mlx-audio-swift", from: "0.1.3"),
+        // IBM Granite Speech 5.0 TurboCTC and its punctuation model. MIT or
+        // Apache 2.0. It pins mlx-swift exactly, which is what pins it below.
+        .package(url: "https://github.com/kylehowells/Granite-MLX", exact: "0.1.1"),
+        // Exact, because Granite-MLX requires it and because the metallib in
+        // tools/MetallibBuilder has to be built from the same version.
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4"),
     ],
     targets: [
         // ONNX Runtime C API headers only. The implementation is already in the
@@ -39,6 +49,9 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "MoonshineVoice", package: "moonshine-swift"),
                 .product(name: "WhisperKit", package: "WhisperKit"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXAudioSTT", package: "mlx-audio-swift"),
+                .product(name: "GraniteMLX", package: "Granite-MLX"),
                 "COnnxRuntime",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]

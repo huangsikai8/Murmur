@@ -27,6 +27,9 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         case small
         case medium
         case largeV3Turbo
+        /// Hugging Face's Distil-Whisper: Large v3's encoder, unchanged, with the
+        /// decoder distilled to two layers on English.
+        case distilLargeV3
 
         public var modelID: String {
             switch self {
@@ -35,6 +38,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             case .small: "openai.whisper-small-en"
             case .medium: "openai.whisper-medium-en"
             case .largeV3Turbo: "openai.whisper-large-v3-turbo"
+            case .distilLargeV3: "huggingface.distil-whisper-large-v3"
             }
         }
 
@@ -50,6 +54,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             case .medium: "openai_whisper-medium.en"
             // OpenAI's large-v3-turbo, published under its release date.
             case .largeV3Turbo: "openai_whisper-large-v3-v20240930"
+            case .distilLargeV3: "distil-whisper_distil-large-v3"
             }
         }
 
@@ -62,7 +67,9 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             case .base: "openai/whisper-base.en"
             case .small: "openai/whisper-small.en"
             case .medium: "openai/whisper-medium.en"
-            case .largeV3Turbo: "openai/whisper-large-v3"
+            // WhisperKit identifies a checkpoint by its dimensions, and
+            // Distil-Whisper's are Large v3's, so it asks for Large v3's tokenizer.
+            case .largeV3Turbo, .distilLargeV3: "openai/whisper-large-v3"
             }
         }
 
@@ -1221,20 +1228,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// question here is whether anything in the hold was ever loud enough to be
     /// a voice.
     public static func peakDecibels(_ samples: [Float], sampleRate: Double = 16000) -> Float {
-        guard !samples.isEmpty else { return -.infinity }
-        let sliceLength = max(1, Int(sampleRate * 0.025))
-        var peak: Float = 0
-        var start = 0
-        while start < samples.count {
-            let count = min(sliceLength, samples.count - start)
-            var meanSquare: Float = 0
-            samples.withUnsafeBufferPointer { buffer in
-                vDSP_measqv(buffer.baseAddress! + start, 1, &meanSquare, vDSP_Length(count))
-            }
-            peak = max(peak, meanSquare.squareRoot())
-            start += count
-        }
-        return 20 * log10(max(peak, 1e-7))
+        SilenceGuard.peakDecibels(samples, sampleRate: sampleRate)
     }
 
     /// Below this, the hold is not decoded at all.
@@ -1244,7 +1238,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// this is the loudest 25 ms of the whole hold, not its average. Chosen to
     /// sit well under speech rather than close to it — a wrong "that was
     /// silence" throws away a sentence, which is the worse failure of the two.
-    private static let silenceCeiling: Float = -45
+    private static let silenceCeiling = SilenceGuard.silenceCeiling
 
     /// Whether the audio a segment was decoded from contains anything loud
     /// enough to have been spoken.
@@ -1278,27 +1272,14 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     private static func peakDecibels(
         _ samples: [Float], in range: Range<Int>, sampleRate: Double = 16000
     ) -> Float {
-        guard !range.isEmpty else { return -.infinity }
-        let sliceLength = max(1, Int(sampleRate * 0.025))
-        var peak: Float = 0
-        var start = range.lowerBound
-        while start < range.upperBound {
-            let count = min(sliceLength, range.upperBound - start)
-            var meanSquare: Float = 0
-            samples.withUnsafeBufferPointer { buffer in
-                vDSP_measqv(buffer.baseAddress! + start, 1, &meanSquare, vDSP_Length(count))
-            }
-            peak = max(peak, meanSquare.squareRoot())
-            start += count
-        }
-        return 20 * log10(max(peak, 1e-7))
+        SilenceGuard.peakDecibels(samples, in: range, sampleRate: sampleRate)
     }
 
     /// Whether the text contains anything a person could have said. Whisper's
     /// most common answer to near-silence is a bare "." or "...", which carries
     /// no words at all and is safe to drop whatever the audio held.
     public static func carriesWords(_ text: String) -> Bool {
-        text.contains { $0.isLetter || $0.isNumber }
+        SilenceGuard.carriesWords(text)
     }
 
     /// Whether a transcript is one of Whisper's stock silence fillers arriving
@@ -1310,21 +1291,8 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// -25 dBFS a real voice peaks at. Someone who says "thank you" out loud
     /// keeps it.
     public static func isInventedSilence(_ text: String, peak: Float) -> Bool {
-        guard peak < inventionFloor else { return false }
-        let stripped = text.lowercased().filter { $0.isLetter || $0.isWhitespace }
-            .trimmingCharacters(in: .whitespaces)
-        return inventedOnSilence.contains(stripped)
+        SilenceGuard.isInventedSilence(text, peak: peak)
     }
-
-    private static let inventionFloor: Float = -38
-
-    /// Whisper's captioned-audio residue. Whole-transcript matches only: these
-    /// words inside a longer sentence are somebody actually speaking.
-    private static let inventedOnSilence: Set<String> = [
-        "you", "thank you", "thanks", "thank you very much", "thanks for watching",
-        "thank you for watching", "bye", "bye bye", "blank audio", "silence",
-        "music", "applause", "subs by www zeoranger co uk",
-    ]
 
     /// English, timestamps on, no special tokens.
     ///

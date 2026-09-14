@@ -423,6 +423,162 @@ enum WhisperTuningTest {
         return 0
     }
 
+    // MARK: - Engines
+
+    /// `--testmodels [dir] modelID …`: the same recordings through different
+    /// speech models, scored the same way, with the two costs a 2B model can
+    /// make unbearable on this machine — load time and memory.
+    static func runModels(
+        directory: String, modelIDs: [String], extraSoundsLike: [String: [String]] = [:]
+    ) async -> Int32 {
+        ModelCatalog.coreMLEngineWired = true
+        ModelCatalog.mlxSupported = true
+        ModelCatalog.moonshineEngineWired = true
+        print("Murmur speech model comparison\n")
+
+        let folder = URL(
+            fileURLWithPath: (directory as NSString).expandingTildeInPath, isDirectory: true)
+        let clips: [Clip]
+        do {
+            clips = try loadClips(in: folder)
+        } catch {
+            print("  FAILED to read \(folder.path): \(error.localizedDescription)")
+            return 1
+        }
+        guard !clips.isEmpty, !modelIDs.isEmpty else {
+            print("  Needs recordings in \(folder.path) and at least one model ID.")
+            return 1
+        }
+
+        // The vocabulary as saved, plus any sounds-like spellings given for this
+        // run only. Added ones replace unconditionally, as `alwaysReplace` does.
+        var terms = VocabularyStore.shared.allTerms
+        for (index, term) in terms.enumerated() {
+            guard let extra = extraSoundsLike[term.text] else { continue }
+            terms[index] = VocabularyTerm(
+                term.text, soundsLike: term.soundsLike + extra, alwaysReplace: true)
+            print("For this run only: \"\(extra.joined(separator: "\", \""))\" -> \(term.text)")
+        }
+        let phrases = terms.map(\.text)
+        let totalSeconds = clips.reduce(0) { $0 + $1.seconds }
+        print(
+            String(
+                format: "%d clip(s), %.1f s of speech. Vocabulary: %@",
+                clips.count, totalSeconds,
+                phrases.isEmpty ? "none" : phrases.joined(separator: ", ")))
+        print("Memory is this process's physical footprint, peak across the run. Core ML")
+        print("models on the Neural Engine are not fully counted in it; MLX models are.\n")
+
+        // The converter's default quality, which is what the app runs.
+        let audio = clips.map { resample($0.samples, from: $0.sampleRate, quality: nil) }
+        var details: [String] = []
+        let header: [String] = [
+            "  ", pad("model", 38), pad("load", 10), pad("WER", 17), pad("vocab", 8),
+            pad("median", 10), pad("total", 11), "peak memory",
+        ]
+        var rows: [String] = []
+
+        for modelID in modelIDs {
+            let name = ModelCatalog.model(id: modelID)?.name ?? modelID
+            guard let engine = SpeechEngineFactory.engine(for: modelID) else {
+                rows.append("  \(pad(name, 38))no engine implements \(modelID)")
+                continue
+            }
+            print("\(name): loading…")
+            let loadStart = ContinuousClock.now
+            do {
+                try await engine.prepare()
+            } catch {
+                rows.append("  \(pad(name, 38))FAILED to load: \(error.localizedDescription)")
+                print("  FAILED to load: \(error.localizedDescription)")
+                await engine.releaseModels()
+                continue
+            }
+            let loadMs = SpeechFixture.milliseconds(since: loadStart)
+            print("  loaded in \(loadMs) ms")
+            await engine.setContextualPhrases(phrases)
+
+            // Not counted, for the same reason as in the tuning comparison.
+            _ = try? await transcribe(audio[0], engine: engine)
+            var peak = footprintMB()
+
+            var tally = Tally()
+            for (index, clip) in clips.enumerated() {
+                do {
+                    let started = ContinuousClock.now
+                    let raw = try await transcribe(audio[index], engine: engine)
+                    tally.decodeMs.append(SpeechFixture.milliseconds(since: started))
+                    peak = max(peak, footprintMB())
+
+                    // Scored as the app delivers it: vocabulary spelling is the
+                    // last thing applied to every engine's output.
+                    let text = VocabularyNormalizer.apply(terms, to: raw)
+                    // One sample per model, since scoring ignores punctuation
+                    // and capitals and a model can lose both unnoticed.
+                    if index == 0 { print("  sample: \(text)") }
+
+                    let score = WordErrorRate.measure(reference: clip.reference, hypothesis: text)
+                    tally.referenceWords += score.referenceWords
+                    tally.errors += score.errors
+                    for phrase in phrases {
+                        let expected = WordErrorRate.occurrences(of: phrase, in: clip.reference)
+                        tally.vocabularyExpected += expected
+                        tally.vocabularyFound += min(
+                            expected, WordErrorRate.occurrences(of: phrase, in: text))
+                    }
+                    if score.errors > 0 {
+                        details.append(
+                            "  \(name) · \(clip.name) — \(score.errors) error(s)\n      \(score.marked)")
+                    }
+                } catch {
+                    tally.failures += 1
+                    details.append("  \(name) · \(clip.name) — FAILED: \(error.localizedDescription)")
+                }
+            }
+            await engine.releaseModels()
+
+            let rate =
+                tally.referenceWords > 0
+                ? Double(tally.errors) / Double(tally.referenceWords) * 100 : 0
+            let sorted = tally.decodeMs.sorted()
+            let columns: [String] = [
+                "  ",
+                pad(name, 38),
+                pad("\(loadMs) ms", 10),
+                pad(String(format: "%.1f%% (%d/%d)", rate, tally.errors, tally.referenceWords), 17),
+                pad("\(tally.vocabularyFound)/\(tally.vocabularyExpected)", 8),
+                pad("\(sorted.isEmpty ? 0 : sorted[sorted.count / 2]) ms", 10),
+                pad("\(sorted.reduce(0, +)) ms", 11),
+                String(format: "%.0f MB", peak),
+                tally.failures > 0 ? "  \(tally.failures) FAILED" : "",
+            ]
+            rows.append(columns.joined())
+            print("  done")
+        }
+
+        print("\n" + header.joined())
+        for row in rows { print(row) }
+        if !details.isEmpty {
+            print("\nEvery transcript with an error, marked ⟨expected→heard⟩, ⟨+extra⟩, ⟨−missing⟩:")
+            for line in details { print(line) }
+        }
+        return 0
+    }
+
+    /// This process's physical footprint in megabytes: what Activity Monitor
+    /// calls Memory, and what counts against the machine.
+    private static func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : 0
+    }
+
     private static func loadClips(in folder: URL) throws -> [Clip] {
         let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
             .filter { $0.hasSuffix(".wav") }
@@ -441,9 +597,12 @@ enum WhisperTuningTest {
         }
     }
 
-    /// One whole hold, fed in the tap's 100 ms buffers without pacing: Whisper
-    /// decodes on release, so arrival speed changes nothing but the wait.
-    private static func transcribe(_ samples: [Float], engine: WhisperEngine) async throws -> String {
+    /// One whole hold, fed in the tap's 100 ms buffers without pacing: every
+    /// engine this runs decodes on release, so arrival speed changes nothing but
+    /// the wait.
+    private static func transcribe(
+        _ samples: [Float], engine: any SpeechRecognitionEngine
+    ) async throws -> String {
         _ = try await engine.beginSession()
         guard let format = ModelComparison.Recording.format else {
             throw SpeechEngineError.audioFormatUnavailable

@@ -317,6 +317,66 @@ public enum ModelCatalog {
                 + "it decodes several times faster than Large v3. Multilingual weights, "
                 + "pinned to English."
         ),
+        // 1445 MB measured on disk, plus the ~3 MB Large v3 tokenizer.
+        AIModelDescriptor(
+            id: WhisperEngine.Variant.distilLargeV3.modelID,
+            layer: .speechRecognition,
+            name: "Distil-Whisper Large v3",
+            vendor: "Hugging Face via WhisperKit",
+            sizeMB: 1448,
+            license: "MIT",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "Large v3's full encoder with a two-layer decoder, distilled on English. "
+                + "The same download as Turbo with a smaller decoder."
+        ),
+        // The next three are measured on disk after a real download.
+        AIModelDescriptor(
+            id: MLXAudioEngine.Variant.cohereTranscribe.modelID,
+            layer: .speechRecognition,
+            name: "Cohere Transcribe 2B",
+            vendor: "Cohere via MLX Audio",
+            sizeMB: 2307,
+            license: "Apache 2.0",
+            streams: false,
+            runtime: .mlx,
+            punctuates: true,
+            summary:
+                "A 2B Conformer encoder with a light decoder, which topped the Hugging Face "
+                + "Open ASR leaderboard when it was released in March 2026. 8-bit weights, "
+                + "run on the GPU."
+        ),
+        AIModelDescriptor(
+            id: MLXAudioEngine.Variant.graniteSpeech41.modelID,
+            layer: .speechRecognition,
+            name: "IBM Granite Speech 4.1 2B",
+            vendor: "IBM via MLX Audio",
+            sizeMB: 3149,
+            license: "Apache 2.0",
+            streams: false,
+            runtime: .mlx,
+            punctuates: true,
+            summary:
+                "A Conformer encoder feeding a 1B Granite language model, with the lowest "
+                + "average error on the Open ASR leaderboard in May 2026. A community 8-bit "
+                + "conversion, run on the GPU."
+        ),
+        AIModelDescriptor(
+            id: GraniteCTCEngine.modelID,
+            layer: .speechRecognition,
+            name: "IBM Granite Speech 5.0 470M",
+            vendor: "IBM via Granite-MLX",
+            sizeMB: 524,
+            license: "Apache 2.0",
+            streams: false,
+            runtime: .mlx,
+            punctuates: true,
+            summary:
+                "A small CTC recognizer from August 2026 that decodes in a single pass, with "
+                + "a separate punctuation and capitalization model. Both are included."
+        ),
 
         // MARK: Text cleanup
         AIModelDescriptor(
@@ -399,6 +459,10 @@ public enum ModelCatalog {
         for variant in WhisperEngine.Variant.allCases where WhisperEngine.isInstalled(variant) {
             ids.insert(variant.modelID)
         }
+        for variant in MLXAudioEngine.Variant.allCases where MLXAudioEngine.isInstalled(variant) {
+            ids.insert(variant.modelID)
+        }
+        if GraniteCTCEngine.isInstalled { ids.insert(GraniteCTCEngine.modelID) }
         return ids
     }
 
@@ -427,6 +491,14 @@ public enum ModelCatalog {
             try await WhisperEngine(variant: variant).install(progress: progress)
             return
         }
+        if let variant = MLXAudioEngine.Variant.from(modelID: descriptor.id) {
+            try await MLXAudioEngine(variant: variant).install(progress: progress)
+            return
+        }
+        if descriptor.id == GraniteCTCEngine.modelID {
+            try await GraniteCTCEngine().install(progress: progress)
+            return
+        }
         throw SpeechEngineError.unavailable("\(descriptor.name) cannot be downloaded yet.")
     }
 
@@ -450,6 +522,14 @@ public enum ModelCatalog {
         }
         if let variant = WhisperEngine.Variant.from(modelID: descriptor.id) {
             try WhisperEngine.delete(variant)
+            return
+        }
+        if let variant = MLXAudioEngine.Variant.from(modelID: descriptor.id) {
+            try MLXAudioEngine.delete(variant)
+            return
+        }
+        if descriptor.id == GraniteCTCEngine.modelID {
+            try GraniteCTCEngine.delete()
         }
     }
 
