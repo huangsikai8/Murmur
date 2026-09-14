@@ -770,7 +770,27 @@ code" given as sounds-like spellings of "VS Code" for the run:
 | Granite Speech 5.0 470M | 1.1% | 14/16 | **83 ms** | see above |
 
 \* Core ML on the Neural Engine is not counted in the footprint; MLX on the GPU
-is. Without the sounds-like spellings every non-Whisper model heard "VS Code"
+is.
+
+**Qwen3-ASR 1.7B is the only model here with no errors at all**, and the first
+whose vocabulary support is real. It takes a free-text `context` placed in its
+system prompt; `MLXAudioEngine` sends the vocabulary there. Same 24 clips,
+without any sounds-like spellings:
+
+| Qwen3-ASR 1.7B | word error | vocabulary | median per clip | peak footprint |
+| --- | --- | --- | --- | --- |
+| vocabulary as context | **0.0% (0/976)** | 16/16 | 1031 ms | 2627 MB |
+| `--no-context` | 0.4% (4/976) | 12/16 | 1389 ms | 2626 MB |
+
+All four errors without the context were "VS Code" heard as "versus code", so the
+context alone does what the sounds-like spelling does for the others. It passes
+`--testsilence` 4 of 4 behind `SilenceGuard`. On the Open ASR leaderboard of
+11 September 2026 it is the most accurate model that can run locally (4.31%
+across the public English sets, #10 overall, behind nine proprietary cloud
+APIs); Granite 4.1 is #19, Cohere #21, Parakeet TDT v2 #23, Whisper Large v3
+Turbo #55. MLX Audio's Qwen3-ASR loader quantizes the text model and leaves the
+audio tower at full precision, and it wants the language named in full
+("English"), not as a code. Without the sounds-like spellings every non-Whisper model heard "VS Code"
 as "versus code" or "verses code", which is what made them look worse in the
 first run. Granite 4.1 had no errors outside that word but took a median
 6.8 s per clip at 4.2 GB; Distil-Whisper was barely faster than Turbo and less

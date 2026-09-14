@@ -5,7 +5,7 @@ import MLX
 import MLXAudioSTT
 
 /// `SpeechRecognitionEngine` for the speech models MLX Audio runs on the GPU:
-/// Cohere Transcribe and IBM Granite Speech 4.1.
+/// Cohere Transcribe, IBM Granite Speech 4.1 and Qwen3-ASR.
 ///
 /// Both are batch models, so this follows `ParakeetBatchEngine`: samples are
 /// collected during the hold and decoded once in `finishSession()`, and the
@@ -17,15 +17,19 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
     public enum Variant: String, Sendable, CaseIterable {
         case cohereTranscribe
         case graniteSpeech41
+        /// The most accurate downloadable model on the Open ASR leaderboard of
+        /// 11 September 2026: 4.31% across its public English test sets.
+        case qwen3ASR17B
 
         public var modelID: String {
             switch self {
             case .cohereTranscribe: "cohere.transcribe-03-2026"
             case .graniteSpeech41: "ibm.granite-speech-4.1-2b"
+            case .qwen3ASR17B: "qwen.qwen3-asr-1.7b"
             }
         }
 
-        /// The converted MLX checkpoint. 8-bit for both, because a 2B model at
+        /// The converted MLX checkpoint. 8-bit throughout, because a 2B model at
         /// full precision needs several gigabytes resident on a 16 GB machine
         /// whose memory is already mostly in use, and loading the full Cohere
         /// build measured 6.7 GB of footprint on Soniqo's own benchmark.
@@ -37,6 +41,8 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
             switch self {
             case .cohereTranscribe: "beshkenadze/cohere-transcribe-03-2026-mlx-8bit"
             case .graniteSpeech41: "divydeep/granite-speech-4.1-2b-mlx-8bit"
+            // Listed by MLX Audio as a supported conversion, unlike the other two.
+            case .qwen3ASR17B: "mlx-community/Qwen3-ASR-1.7B-8bit"
             }
         }
 
@@ -46,16 +52,21 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
             switch self {
             case .cohereTranscribe: "cohere_asr"
             case .graniteSpeech41: "granite_speech"
+            case .qwen3ASR17B: "qwen3_asr"
             }
         }
 
         /// The language hint passed to generation. Cohere reads it as the
         /// language spoken. **Granite reads the same parameter as a translation
         /// target**, so it is given none: an English hint asks it to translate.
+        /// Qwen3-ASR identifies the language itself when given none, and a
+        /// two-second hold is little to identify it from; MLX Audio's own
+        /// example names it in full.
         public var languageHint: String? {
             switch self {
             case .cohereTranscribe: "en"
             case .graniteSpeech41: nil
+            case .qwen3ASR17B: "English"
             }
         }
 
@@ -66,6 +77,10 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
 
     private let variant: Variant
     private var model: (any STTGenerationModel)?
+
+    /// The vocabulary, as `setContextualPhrases` last gave it. Only Qwen3-ASR
+    /// has anywhere to put it.
+    private var contextualPhrases: [String] = []
 
     /// Samples for the current utterance, at 16 kHz mono.
     private var samples: [Float] = []
@@ -151,7 +166,31 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
     /// Decodes on release, so the overlay stays empty during the hold.
     public nonisolated var streamsLiveText: Bool { false }
 
-    /// Both models read 16 kHz mono.
+    /// Qwen3-ASR takes a free-text context, placed in its system prompt, and
+    /// the vocabulary goes there. Cohere and Granite have no such input.
+    public nonisolated var biasesTowardPhrases: Bool {
+        variant == .qwen3ASR17B && Self.sendsVocabularyContext
+    }
+
+    /// Whether Qwen3-ASR is handed the vocabulary as context. **Test-only: true
+    /// in the app**, switched off by `--no-context` to measure what it buys.
+    public nonisolated(unsafe) static var sendsVocabularyContext = true
+
+    /// `async` for the reason `WhisperEngine.setContextualPhrases` gives: the
+    /// protocol extension's no-op is `async`, and a synchronous version here
+    /// loses to it when called on the concrete type.
+    public func setContextualPhrases(_ phrases: [String]) async {
+        contextualPhrases = phrases
+    }
+
+    /// The terms as one comma-separated list, or empty when there are none.
+    static func qwenContext(for phrases: [String]) -> String {
+        phrases.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+    }
+
+    /// All three models read 16 kHz mono.
     public func preferredInputFormat() async -> AVAudioFormat? {
         AVAudioFormat(
             commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
@@ -231,6 +270,12 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
         let output =
             if variant == .graniteSpeech41, let granite = model as? GraniteSpeechModel {
                 granite.generate(audio: MLXArray(collected), prompt: Self.granitePunctuationPrompt)
+            } else if variant == .qwen3ASR17B, let qwen = model as? Qwen3ASRModel {
+                qwen.generate(
+                    audio: MLXArray(collected),
+                    context: Self.sendsVocabularyContext
+                        ? Self.qwenContext(for: contextualPhrases) : "",
+                    language: variant.languageHint)
             } else {
                 model.generate(
                     audio: MLXArray(collected),

@@ -363,6 +363,22 @@ public enum ModelCatalog {
                 + "average error on the Open ASR leaderboard in May 2026. A community 8-bit "
                 + "conversion, run on the GPU."
         ),
+        // 2359 MB measured on disk.
+        AIModelDescriptor(
+            id: MLXAudioEngine.Variant.qwen3ASR17B.modelID,
+            layer: .speechRecognition,
+            name: "Qwen3-ASR 1.7B",
+            vendor: "Qwen via MLX Audio",
+            sizeMB: 2359,
+            license: "Apache 2.0",
+            streams: false,
+            runtime: .mlx,
+            punctuates: true,
+            summary:
+                "The most accurate downloadable model on the Hugging Face Open ASR "
+                + "leaderboard in September 2026, ahead of every other model you can run "
+                + "locally. 8-bit weights, run on the GPU."
+        ),
         AIModelDescriptor(
             id: GraniteCTCEngine.modelID,
             layer: .speechRecognition,

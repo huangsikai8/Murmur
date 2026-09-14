@@ -1211,7 +1211,7 @@ await runner.test("an annotation on its own carries no words") {
 runner.suite("Model catalog")
 
 await runner.test("both layers offer the expected number of models") {
-    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 17)
+    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 18)
     runner.expectEqual(ModelCatalog.models(in: .correction).count, 5)
 }
 
@@ -1250,6 +1250,7 @@ await runner.test("every MLX Audio and Granite-MLX model is in the catalog exact
 await runner.test("Granite Speech 4.1 is never handed a language hint") {
     runner.expectEqual(MLXAudioEngine.Variant.graniteSpeech41.languageHint, nil)
     runner.expectEqual(MLXAudioEngine.Variant.cohereTranscribe.languageHint, "en")
+    runner.expectEqual(MLXAudioEngine.Variant.qwen3ASR17B.languageHint, "English")
 }
 
 // Granite-MLX's own default is ~/Documents/huggingface, and a checkpoint named
@@ -1335,6 +1336,10 @@ await runner.test("an engine's phrase-biasing claim survives the protocol existe
     runner.expectEqual(turbo.biasesTowardPhrases, true)
     let small: any SpeechRecognitionEngine = WhisperEngine(variant: .small)
     runner.expectEqual(small.biasesTowardPhrases, false)
+    let qwen: any SpeechRecognitionEngine = MLXAudioEngine(variant: .qwen3ASR17B)
+    runner.expectEqual(qwen.biasesTowardPhrases, true)
+    let cohere: any SpeechRecognitionEngine = MLXAudioEngine(variant: .cohereTranscribe)
+    runner.expectEqual(cohere.biasesTowardPhrases, false)
     let apple: any SpeechRecognitionEngine = AppleSpeechEngine()
     runner.expectEqual(apple.biasesTowardPhrases, true)
     let parakeet: any SpeechRecognitionEngine = ParakeetBatchEngine()

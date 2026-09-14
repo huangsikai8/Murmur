@@ -36,6 +36,13 @@ if let index = CommandLine.arguments.firstIndex(of: "--whisper-tuned") {
             + "\(tuning.retries) retries, vocabulary prompt \(promptLabel)\n")
 }
 
+// `--no-context` stops Qwen3-ASR being handed the vocabulary as context, for any
+// test after it, so the difference the context makes can be measured.
+if CommandLine.arguments.contains("--no-context") {
+    MLXAudioEngine.sendsVocabularyContext = false
+    print("Qwen3-ASR vocabulary context: off\n")
+}
+
 // `--recordclips [dir]` records read passages at the microphone's own rate for
 // `--testwhispertuning` to replay. Needs an interactive terminal.
 if let index = CommandLine.arguments.firstIndex(of: "--recordclips") {
