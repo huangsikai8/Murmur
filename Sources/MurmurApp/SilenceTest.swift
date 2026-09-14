@@ -45,6 +45,9 @@ enum SilenceTest {
             print("  FAILED to prepare: \(error.localizedDescription)")
             return 1
         }
+        // As the app does: Whisper sends the vocabulary as a prompt, and a
+        // prompt is exactly what could make a silent hold come back as words.
+        await engine.setContextualPhrases(VocabularyStore.shared.phrases)
 
         let format =
             await engine.preferredInputFormat()

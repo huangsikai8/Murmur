@@ -66,6 +66,18 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             }
         }
 
+        /// Whether the vocabulary is sent to this variant's decoder as a prompt.
+        ///
+        /// Turbo only, because Turbo is what it was measured safe on. On 24 `say`
+        /// clips it took Turbo from 8 to 16 vocabulary hits in 16 and word error
+        /// from 1.1% to 0.2%, and six forced-stop runs of `--testlong` read the
+        /// same with it as without. Small gained too — 10 to 14 hits, 1.0% to
+        /// 0.6% — but its forced-stop arm broke in 3 runs of 3 with the prompt
+        /// and 0 of 3 without, repeating or inventing words where a recovery
+        /// joins the first pass, even with the prompt kept off the recoveries.
+        /// Tiny, Base and Medium are unmeasured.
+        public var promptsVocabulary: Bool { self == .largeV3Turbo }
+
         public static func from(modelID: String) -> Variant? {
             allCases.first { $0.modelID == modelID }
         }
@@ -79,6 +91,10 @@ public actor WhisperEngine: SpeechRecognitionEngine {
 
     /// Samples for the current utterance, at 16 kHz mono.
     private var samples: [Float] = []
+
+    /// The vocabulary, as `setContextualPhrases` last gave it. Sent to the
+    /// decoder as a prompt on the first pass only — see `decodeWholeHold`.
+    private var contextualPhrases: [String] = []
     private var updateContinuation: AsyncStream<TranscriptUpdate>.Continuation?
 
     /// Ordered path from the audio thread into the sample buffer. Yielding is
@@ -185,6 +201,31 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// Decodes on release, so the overlay stays empty during the hold.
     public nonisolated var streamsLiveText: Bool { false }
 
+    /// Whisper has no contextual-phrase API, but it reads a prompt as text said
+    /// just before the audio, which biases it towards those spellings — "VS
+    /// Code" otherwise arrives as "versus code". Only where
+    /// `Variant.promptsVocabulary` says the prompt is safe, so a variant sent
+    /// none still reports, truthfully, that the vocabulary does nothing.
+    public nonisolated var biasesTowardPhrases: Bool { variant.promptsVocabulary }
+
+    /// `async` on purpose, though nothing here awaits. The protocol extension
+    /// has an empty `async` default with the same signature, and from async code
+    /// Swift prefers an `async` overload — so a synchronous version here lost to
+    /// the no-op whenever it was called on the concrete type, and the vocabulary
+    /// silently never arrived.
+    public func setContextualPhrases(_ phrases: [String]) async {
+        contextualPhrases = phrases
+    }
+
+    /// The vocabulary as a decoder prompt: the terms as one comma-separated
+    /// list, or `nil` when there are none.
+    public static func prompt(for phrases: [String]) -> String? {
+        let terms = phrases.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !terms.isEmpty else { return nil }
+        return terms.joined(separator: ", ") + "."
+    }
+
     /// Whisper's feature extractor expects 16 kHz mono, and collecting samples
     /// in that form avoids a conversion pass over the whole utterance at
     /// release.
@@ -276,8 +317,11 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         }
 
         let decodeStart = ContinuousClock.now
+        let prompt =
+            Self.tuning.vocabularyPrompt.applies(to: variant)
+            ? Self.prompt(for: contextualPhrases) : nil
         let (pieces, recoveries, cost) = try await Self.decodeWholeHold(
-            collected, with: whisperKit)
+            collected, with: whisperKit, prompt: prompt)
         let decodeMs = Int((ContinuousClock.now - decodeStart) / .milliseconds(1))
         Self.lastHoldCost = cost
 
@@ -355,9 +399,9 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// Decodes `samples` and returns what came back, in seconds from the start
     /// of `samples`.
     private static func decode(
-        _ samples: [Float], with whisperKit: WhisperKit
+        _ samples: [Float], with whisperKit: WhisperKit, prompt: String? = nil
     ) async throws -> (pieces: [Piece], cost: DecodeCost) {
-        let options = decodeOptions(for: whisperKit)
+        let options = decodeOptions(for: whisperKit, prompt: prompt)
         let results = try await whisperKit.transcribe(
             audioArray: samples, decodeOptions: options)
         let seconds = Double(samples.count) / sampleRate
@@ -409,10 +453,18 @@ public actor WhisperEngine: SpeechRecognitionEngine {
     /// enough to hold a word and loud enough to be speech, and `floor` moves
     /// past whatever was just attempted, so a decoder that stops for its own
     /// reasons cannot be asked the same question twice.
+    ///
+    /// **The vocabulary prompt goes to the first pass only.** A recovery decodes
+    /// a short slice, and a prompt steers a short slice far harder than a whole
+    /// window: measured on Small's forced-stop arm of `--testlong`, prompting the
+    /// recoveries too broke them in 3 runs of 3 — twice a six-word duplicate at
+    /// the seam, once "Thanks for watching." — where unprompted recoveries gave
+    /// neither. Kept off the recoveries, it still broke Small's, which is why
+    /// `Variant.promptsVocabulary` decides whether there is a prompt at all.
     private static func decodeWholeHold(
-        _ samples: [Float], with whisperKit: WhisperKit
+        _ samples: [Float], with whisperKit: WhisperKit, prompt: String?
     ) async throws -> (pieces: [Piece], recoveries: Int, cost: DecodeCost) {
-        var (pieces, cost) = try await decode(samples, with: whisperKit)
+        var (pieces, cost) = try await decode(samples, with: whisperKit, prompt: prompt)
         var floor: Double = 0
         var recoveries = 0
         let budget = maxRecoveryPasses(forSeconds: Double(samples.count) / sampleRate)
@@ -903,6 +955,9 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         public var retrySeconds: Double = 0
         /// Attempts thrown away and decoded again at a higher temperature.
         public var retries = 0
+        /// Tokens of vocabulary prompt the decoder was handed, which is the only
+        /// evidence the prompt arrived: a missing one transcribes perfectly well.
+        public var promptTokens = 0
 
         public init() {}
 
@@ -916,6 +971,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         /// read a temperature from.
         init(_ results: [TranscriptionResult], options: DecodingOptions) {
             let step = Double(options.temperatureIncrementOnFallback)
+            promptTokens = options.promptTokens?.count ?? 0
             for result in results {
                 let timings = result.timings
                 windows += Int(timings.totalEncodingRuns)
@@ -945,6 +1001,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             decoderSeconds += other.decoderSeconds
             retrySeconds += other.retrySeconds
             retries += other.retries
+            promptTokens += other.promptTokens
         }
 
         /// The breakdown as `Murmur.log` prints it.
@@ -956,6 +1013,7 @@ public actor WhisperEngine: SpeechRecognitionEngine {
             if retries > 0 || retrySeconds > 0 {
                 text += " of which \(retries) retry(s) \(ms(retrySeconds)) ms"
             }
+            if promptTokens > 0 { text += ", prompted with \(promptTokens) tokens" }
             return text
         }
     }
@@ -977,23 +1035,42 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         /// `temperatureFallbackCount`. When every attempt is rejected WhisperKit
         /// keeps the *last* one, which is the most random of them.
         public var retries: Int
-        /// Text the decoder is conditioned on as if it had just been said, which
-        /// is how Whisper is biased towards a spelling.
-        public var prompt: String?
+        /// Whether the vocabulary from `setContextualPhrases` is sent to the
+        /// first pass as a prompt.
+        public var vocabularyPrompt: VocabularyPrompt
 
-        public init(firstTokenCutoff: Bool, retries: Int, prompt: String?) {
+        public enum VocabularyPrompt: Sendable, Equatable {
+            /// Never, to measure what the prompt buys.
+            case off
+            /// Where `Variant.promptsVocabulary` says it is safe.
+            case perVariant
+            /// On every variant, to measure one that has not been cleared.
+            case always
+
+            func applies(to variant: Variant) -> Bool {
+                switch self {
+                case .off: false
+                case .perVariant: variant.promptsVocabulary
+                case .always: true
+                }
+            }
+        }
+
+        public init(firstTokenCutoff: Bool, retries: Int, vocabularyPrompt: VocabularyPrompt) {
             self.firstTokenCutoff = firstTokenCutoff
             self.retries = retries
-            self.prompt = prompt
+            self.vocabularyPrompt = vocabularyPrompt
         }
 
-        /// WhisperKit's defaults, which is what the app has always run.
-        public static let shipped = DecodeTuning(firstTokenCutoff: true, retries: 5, prompt: nil)
+        /// What the app runs: WhisperKit's fallback defaults, and the prompt
+        /// where it has been measured safe.
+        public static let shipped = DecodeTuning(
+            firstTokenCutoff: true, retries: 5, vocabularyPrompt: .perVariant)
 
-        /// Every change under test at once.
-        public static func candidate(prompt: String?) -> DecodeTuning {
-            DecodeTuning(firstTokenCutoff: false, retries: 2, prompt: prompt)
-        }
+        /// The fallback changes still under test. Neither can be judged on
+        /// `say`, which never makes the decoder retry.
+        public static let candidate = DecodeTuning(
+            firstTokenCutoff: false, retries: 2, vocabularyPrompt: .perVariant)
     }
 
     public nonisolated(unsafe) static var tuning = DecodeTuning.shipped
@@ -1283,15 +1360,18 @@ public actor WhisperEngine: SpeechRecognitionEngine {
         )
     }
 
-    /// `baseDecodeOptions` with the current `tuning` and any test cap applied.
-    /// Built per decode rather than once, because both can change between holds
-    /// and the prompt has to be tokenized by the model that will read it.
-    private static func decodeOptions(for whisperKit: WhisperKit) -> DecodingOptions {
+    /// `baseDecodeOptions` with the current `tuning`, a prompt, and any test cap
+    /// applied. Built per decode rather than once, because all three can change
+    /// between holds and the prompt has to be tokenized by the model that will
+    /// read it.
+    private static func decodeOptions(
+        for whisperKit: WhisperKit, prompt: String?
+    ) -> DecodingOptions {
         var options = baseDecodeOptions
         let tuning = tuning
         if !tuning.firstTokenCutoff { options.firstTokenLogProbThreshold = nil }
         options.temperatureFallbackCount = tuning.retries
-        if let prompt = tuning.prompt, let tokenizer = whisperKit.tokenizer {
+        if let prompt, let tokenizer = whisperKit.tokenizer {
             // Leading space: BPE gives a word a different token with and without
             // the space before it, and the terms arrive mid-sentence.
             options.promptTokens = tokenizer.encode(text: " " + prompt)

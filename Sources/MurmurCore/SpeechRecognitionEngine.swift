@@ -71,6 +71,14 @@ public protocol SpeechRecognitionEngine: AnyObject, Sendable {
     /// catalog is a claim and this is the behaviour. A model wrongly marked
     /// live shows an empty overlay for the whole hold and reads as broken.
     nonisolated var streamsLiveText: Bool { get }
+
+    /// Whether `setContextualPhrases` does anything at all — see the default.
+    ///
+    /// A requirement, not only an extension member: the app asks through
+    /// `any SpeechRecognitionEngine`, and an extension-only property is
+    /// dispatched statically there, so every engine answered `false` and the
+    /// log said Apple's recognizer ignored a vocabulary it was applying.
+    nonisolated var biasesTowardPhrases: Bool { get }
 }
 
 extension SpeechRecognitionEngine {
@@ -87,7 +95,7 @@ extension SpeechRecognitionEngine {
     /// applies it, so a word list can sit in Settings doing nothing while the
     /// speaker keeps wondering why their own terms are misheard. Engines that
     /// really bias say so, and the app logs when the selected one does not.
-    public var biasesTowardPhrases: Bool { false }
+    public nonisolated var biasesTowardPhrases: Bool { false }
 }
 
 /// Builds the engine for a catalog model ID.

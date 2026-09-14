@@ -1275,13 +1275,40 @@ await runner.test("vocabulary occurrences match whole words, ignoring case and p
     runner.expectEqual(WordErrorRate.occurrences(of: "Claude", in: "Claudette and Claude"), 1)
 }
 
-// The decoder settings `--testwhispertuning` varies are test-only until one is
+// The fallback settings `--testwhispertuning` varies are test-only until one is
 // chosen. A tuning left switched on would change every dictation silently.
-await runner.test("the app decodes with WhisperKit's default fallback settings") {
+await runner.test("the app decodes with WhisperKit's fallback defaults and the vocabulary prompt") {
     runner.expectEqual(WhisperEngine.tuning, .shipped)
     runner.expectEqual(WhisperEngine.DecodeTuning.shipped.firstTokenCutoff, true)
     runner.expectEqual(WhisperEngine.DecodeTuning.shipped.retries, 5)
-    runner.expectEqual(WhisperEngine.DecodeTuning.shipped.prompt, nil)
+    runner.expectEqual(WhisperEngine.DecodeTuning.shipped.vocabularyPrompt, .perVariant)
+}
+
+// The prompt broke Small's recovery of an early-stopped decode in 3 runs of 3.
+// A variant is cleared for it by measurement, one at a time.
+await runner.test("only Large v3 Turbo is prompted with the vocabulary") {
+    runner.expectEqual(
+        WhisperEngine.Variant.allCases.filter(\.promptsVocabulary), [.largeV3Turbo])
+}
+
+await runner.test("Whisper's vocabulary prompt lists the terms, and is absent without any") {
+    runner.expectEqual(WhisperEngine.prompt(for: ["Claude", " VS Code "]), "Claude, VS Code.")
+    runner.expectEqual(WhisperEngine.prompt(for: []), nil)
+    runner.expectEqual(WhisperEngine.prompt(for: ["  ", ""]), nil)
+}
+
+// Asked the way the app asks, through the protocol. As an extension-only member
+// this answered `false` for every engine however it was implemented, and the
+// log reported a vocabulary being ignored by engines that applied it.
+await runner.test("an engine's phrase-biasing claim survives the protocol existential") {
+    let turbo: any SpeechRecognitionEngine = WhisperEngine(variant: .largeV3Turbo)
+    runner.expectEqual(turbo.biasesTowardPhrases, true)
+    let small: any SpeechRecognitionEngine = WhisperEngine(variant: .small)
+    runner.expectEqual(small.biasesTowardPhrases, false)
+    let apple: any SpeechRecognitionEngine = AppleSpeechEngine()
+    runner.expectEqual(apple.biasesTowardPhrases, true)
+    let parakeet: any SpeechRecognitionEngine = ParakeetBatchEngine()
+    runner.expectEqual(parakeet.biasesTowardPhrases, false)
 }
 
 await runner.test("each speech model's streaming claim matches its engine") {

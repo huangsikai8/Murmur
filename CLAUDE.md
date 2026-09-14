@@ -617,16 +617,31 @@ the ordering is what makes it safe, so do not move that call.
   synthesized clips, alternated with the full build twice: ~950 MB less disk and
   nothing else measurable. Peak RSS cannot compare them — Core ML's model memory
   does not appear in it (110-165 MB for both).
-* **A vocabulary prompt is the one decoder change that measurably helps, and it
-  is not safe yet.** `--testwhispertuning` on 24 `say` clips (4 voices × 6
+* **The vocabulary reaches Whisper as a prompt — on Large v3 Turbo only.**
+  Whisper has no phrase-biasing API, but it reads a prompt as text said just
+  before the audio. `--testwhispertuning` on 24 `say` clips (4 voices × 6
   passages): Turbo word error 1.1% → 0.2% and vocabulary 8/16 → 16/16 — "VS Code"
   otherwise arrives as "versus code"; Small 1.0% → 0.6%, 10/16 → 14/16. The prompt
-  never inserted its own text. But on Small's forced-stop arm of `--testlong` it
-  broke the recovery in 3 runs of 3: twice a six-word duplicate at the seam
-  ("neighbor the almanac says the tide is" twice), once "Thanks for watching."
-  Shipped settings produced neither. The likely reason, not yet tested, is that
-  a recovery decodes a short slice, and a prompt steers a short slice far harder
-  than a whole window. `DecodeTuning` keeps it test-only.
+  never inserted its own text. But it breaks Small's recovery of an early-stopped
+  decode: on the forced-stop arm of `--testlong`, 3 runs of 3 with the prompt
+  (a six-word duplicate at the seam, "the third" or "Thanks for watching."
+  invented) against 0 of 3 without. Keeping the prompt off the recovery passes
+  did not fix it, so it is off the recoveries *and* gated per model:
+  `Variant.promptsVocabulary` is true for Turbo alone, whose forced-stop runs read
+  the same with and without it. Tiny, Base and Medium are unmeasured, so they get
+  no prompt, and `biasesTowardPhrases` says so. The log line ends
+  `prompted with N tokens` when a prompt went in; `--whisper-tuned prompt` sends
+  it to every model to measure one.
+* **An engine member with the same name as a protocol-extension default can lose
+  to the default.** Two of them, both silent. `biasesTowardPhrases` was declared
+  only in the extension, so through `any SpeechRecognitionEngine` — the only way
+  the app asks — every engine answered `false`, and the log reported Apple's
+  recognizer ignoring a vocabulary it was applying. It is a requirement now, and
+  a test asks through the existential. And `WhisperEngine.setContextualPhrases`
+  was synchronous while the extension's no-op is `async`: from async code Swift
+  prefers the `async` overload, so a call on the concrete type ran the no-op and
+  a whole tuning comparison measured "with the prompt" without one. It is `async`
+  now; `prompted with N tokens` is what caught it.
 * **The cut-off and retry settings cannot be judged on `say`.** Synthesized
   speech produced zero retries in every arm, so removing the first-token cut-off
   or dropping to 2 retries changed nothing measurable; only a real voice

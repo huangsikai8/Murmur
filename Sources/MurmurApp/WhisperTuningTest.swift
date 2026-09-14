@@ -37,15 +37,6 @@ enum WhisperTuningTest {
         "Here is a longer note, so that this recording runs past half a minute. When I dictate into VS Code, the text usually lands correctly, but every so often a whole phrase goes missing near the end. I would like to understand whether that comes from the microphone, from the recognizer, or from the way the clipboard is restored afterwards. If Claude can help narrow it down, I will write up what we find and share it with the rest of the team, so that nobody has to rediscover the same problem later.",
     ]
 
-    /// The vocabulary as a decoder prompt: the terms as one comma-separated
-    /// list, or `nil` when there are none.
-    static func prompt(for phrases: [String]) -> String? {
-        let terms = phrases.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !terms.isEmpty else { return nil }
-        return terms.joined(separator: ", ") + "."
-    }
-
     /// The smaller sibling build of Large v3 Turbo, benchmarked against the full
     /// one with `--quantized-turbo`. Not in the catalog.
     static let quantizedTurboFolder = "openai_whisper-large-v3-v20240930_626MB"
@@ -232,6 +223,8 @@ enum WhisperTuningTest {
         var errors = 0
         var vocabularyExpected = 0
         var vocabularyFound = 0
+        /// Holds whose decoder was actually handed the prompt.
+        var prompted = 0
         var decodeMs: [Int] = []
         var cost = WhisperEngine.DecodeCost()
         var failures = 0
@@ -239,28 +232,31 @@ enum WhisperTuningTest {
 
     /// One change at a time against the app's current settings, then all of
     /// them together, so an effect can be attributed to what caused it.
-    private static func arms(prompt: String?) -> [Arm] {
+    private static func arms(hasVocabulary: Bool) -> [Arm] {
         let shipped = WhisperEngine.DecodeTuning.shipped
-        let candidate = WhisperEngine.DecodeTuning.candidate(prompt: prompt)
+        let candidate = WhisperEngine.DecodeTuning.candidate
         var noCutoff = shipped
         noCutoff.firstTokenCutoff = false
         var fewerRetries = shipped
         fewerRetries.retries = candidate.retries
 
-        var arms = [
-            Arm(name: "current settings", quality: .medium, tuning: shipped),
+        var arms = [Arm(name: "current settings", quality: .medium, tuning: shipped)]
+        if hasVocabulary {
+            var unprompted = shipped
+            unprompted.vocabularyPrompt = .off
+            arms.append(Arm(name: "no vocabulary prompt", quality: .medium, tuning: unprompted))
+            var everywhere = shipped
+            everywhere.vocabularyPrompt = .always
+            arms.append(Arm(name: "prompt on every model", quality: .medium, tuning: everywhere))
+        }
+        arms += [
             Arm(name: "resampler at max quality", quality: .max, tuning: shipped),
             Arm(name: "first-token cut-off off", quality: .medium, tuning: noCutoff),
             Arm(
                 name: "\(candidate.retries) retries, not \(shipped.retries)", quality: .medium,
                 tuning: fewerRetries),
+            Arm(name: "all of the above", quality: .max, tuning: candidate),
         ]
-        if let prompt {
-            var prompted = shipped
-            prompted.prompt = prompt
-            arms.append(Arm(name: "vocabulary prompt", quality: .medium, tuning: prompted))
-        }
-        arms.append(Arm(name: "all of the above", quality: .max, tuning: candidate))
         return arms
     }
 
@@ -286,7 +282,6 @@ enum WhisperTuningTest {
         }
 
         let phrases = VocabularyStore.shared.phrases
-        let prompt = prompt(for: phrases)
         let totalSeconds = clips.reduce(0) { $0 + $1.seconds }
         print(
             String(
@@ -348,7 +343,7 @@ enum WhisperTuningTest {
             return 1
         }
 
-        let arms = arms(prompt: prompt)
+        let arms = arms(hasVocabulary: WhisperEngine.prompt(for: phrases) != nil)
         var details: [String] = []
         defer { WhisperEngine.tuning = .shipped }
 
@@ -363,6 +358,8 @@ enum WhisperTuningTest {
                 continue
             }
             print("  loaded in \(SpeechFixture.milliseconds(since: loadStart)) ms")
+            // As `DictationController` does for every engine.
+            await engine.setContextualPhrases(phrases)
 
             // Not counted: the first decode after a load can include Core ML
             // specializing the model, which would be charged to whichever arm
@@ -370,10 +367,12 @@ enum WhisperTuningTest {
             WhisperEngine.tuning = .shipped
             _ = try? await transcribe(resampled[AVAudioQuality.medium.rawValue]![0], engine: engine)
 
-            print(
-                "  " + pad("setting", 28) + pad("WER", 17) + pad("vocab", 8) + pad("retries", 9)
-                    + pad("median", 10) + pad("total", 10) + pad("encoder", 11)
-                    + pad("decoder", 11) + "retrying")
+            let header: [String] = [
+                "  ", pad("setting", 28), pad("WER", 17), pad("vocab", 8), pad("prompted", 10),
+                pad("retries", 9), pad("median", 10), pad("total", 10), pad("encoder", 11),
+                pad("decoder", 11), "retrying",
+            ]
+            print(header.joined())
             for arm in arms {
                 WhisperEngine.tuning = arm.tuning
                 var tally = Tally()
@@ -387,7 +386,10 @@ enum WhisperTuningTest {
                             let started = ContinuousClock.now
                             let text = try await transcribe(audio, engine: engine)
                             tally.decodeMs.append(SpeechFixture.milliseconds(since: started))
-                            if let cost = WhisperEngine.lastHoldCost { tally.cost.add(cost) }
+                            if let cost = WhisperEngine.lastHoldCost {
+                                tally.cost.add(cost)
+                                if cost.promptTokens > 0 { tally.prompted += 1 }
+                            }
 
                             let score = WordErrorRate.measure(reference: clip.reference, hypothesis: text)
                             tally.referenceWords += score.referenceWords
@@ -470,16 +472,23 @@ enum WhisperTuningTest {
         let sorted = tally.decodeMs.sorted()
         let median = sorted.isEmpty ? 0 : sorted[sorted.count / 2]
         let ms = { (seconds: Double) in "\(Int((seconds * 1000).rounded())) ms" }
-        return "  " + pad(name, 28)
-            + pad(String(format: "%.1f%% (%d/%d)", rate, tally.errors, tally.referenceWords), 17)
-            + pad("\(tally.vocabularyFound)/\(tally.vocabularyExpected)", 8)
-            + pad("\(tally.cost.retries)", 9)
-            + pad("\(median) ms", 10)
-            + pad("\(sorted.reduce(0, +)) ms", 10)
-            + pad(ms(tally.cost.encoderSeconds), 11)
-            + pad(ms(tally.cost.decoderSeconds), 11)
-            + ms(tally.cost.retrySeconds)
-            + (tally.failures > 0 ? "  \(tally.failures) FAILED" : "")
+        // Built as a list: one long `+` chain of these is more than the type
+        // checker will resolve in reasonable time.
+        let columns: [String] = [
+            "  ",
+            pad(name, 28),
+            pad(String(format: "%.1f%% (%d/%d)", rate, tally.errors, tally.referenceWords), 17),
+            pad("\(tally.vocabularyFound)/\(tally.vocabularyExpected)", 8),
+            pad("\(tally.prompted)/\(tally.decodeMs.count)", 10),
+            pad("\(tally.cost.retries)", 9),
+            pad("\(median) ms", 10),
+            pad("\(sorted.reduce(0, +)) ms", 10),
+            pad(ms(tally.cost.encoderSeconds), 11),
+            pad(ms(tally.cost.decoderSeconds), 11),
+            ms(tally.cost.retrySeconds),
+            tally.failures > 0 ? "  \(tally.failures) FAILED" : "",
+        ]
+        return columns.joined()
     }
 
     private static func pad(_ text: String, _ width: Int) -> String {

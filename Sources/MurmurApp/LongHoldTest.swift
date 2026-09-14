@@ -147,6 +147,9 @@ enum LongHoldTest {
         let started = ContinuousClock.now
         do {
             try await engine.prepare()
+            // As the app does, so the prompt Whisper builds from the vocabulary
+            // is part of what this test holds to account.
+            await engine.setContextualPhrases(VocabularyStore.shared.phrases)
             let format = await engine.preferredInputFormat()
             text = try await transcribe(audio, engine: engine, format: format)
         } catch {

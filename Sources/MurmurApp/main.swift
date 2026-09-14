@@ -7,14 +7,14 @@ if CommandLine.arguments.contains(where: { $0.hasPrefix("--") }) {
     setvbuf(stdout, nil, _IONBF, 0)
 }
 
-// `--whisper-tuned [cutoff,retries,prompt]` runs any test after it with the
-// candidate Whisper decoder settings instead of the shipped ones — all of them,
-// or only those listed, so a regression can be traced to the one that caused it.
-// For `--testsilence` and `--testlong`, which must still pass before a setting
-// can become the default.
+// `--whisper-tuned [cutoff,retries,prompt|noprompt]` runs any test after it with
+// Whisper decoder settings other than the shipped ones — the candidate fallback
+// changes, or only those listed, so a regression can be traced to the one that
+// caused it. `prompt` sends the vocabulary prompt to every variant, not only the
+// ones cleared for it; `noprompt` sends it to none. For `--testsilence` and
+// `--testlong`, which must pass before a setting ships.
 if let index = CommandLine.arguments.firstIndex(of: "--whisper-tuned") {
-    let candidate = WhisperEngine.DecodeTuning.candidate(
-        prompt: WhisperTuningTest.prompt(for: VocabularyStore.shared.phrases))
+    let candidate = WhisperEngine.DecodeTuning.candidate
     let listed: Set<String>? =
         CommandLine.arguments.count > index + 1
         && !CommandLine.arguments[index + 1].hasPrefix("--")
@@ -22,12 +22,18 @@ if let index = CommandLine.arguments.firstIndex(of: "--whisper-tuned") {
     var tuning = WhisperEngine.DecodeTuning.shipped
     if listed?.contains("cutoff") ?? true { tuning.firstTokenCutoff = candidate.firstTokenCutoff }
     if listed?.contains("retries") ?? true { tuning.retries = candidate.retries }
-    if listed?.contains("prompt") ?? true { tuning.prompt = candidate.prompt }
+    if listed?.contains("prompt") ?? false { tuning.vocabularyPrompt = .always }
+    if listed?.contains("noprompt") ?? false { tuning.vocabularyPrompt = .off }
     WhisperEngine.tuning = tuning
+    let promptLabel =
+        switch tuning.vocabularyPrompt {
+        case .off: "off"
+        case .perVariant: "where cleared"
+        case .always: "on every model"
+        }
     print(
         "Whisper decoder: first-token cut-off \(tuning.firstTokenCutoff ? "on" : "off"), "
-            + "\(tuning.retries) retries, prompt "
-            + (tuning.prompt.map { "\"\($0)\"" } ?? "none") + "\n")
+            + "\(tuning.retries) retries, vocabulary prompt \(promptLabel)\n")
 }
 
 // `--recordclips [dir]` records read passages at the microphone's own rate for
