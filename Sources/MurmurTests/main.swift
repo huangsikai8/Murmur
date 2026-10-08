@@ -1206,12 +1206,188 @@ await runner.test("an annotation on its own carries no words") {
     }
 }
 
+// MARK: - Caret continuation
+
+// The defect this exists for: every engine capitalizes its first word, so
+// dictating with the caret mid-sentence produced "and then We should ship it".
+await runner.test("a transcript continuing a sentence is not capitalized") {
+    runner.expectEqual(
+        CaretContinuation.join("We should ship it.", following: "and then "),
+        "we should ship it.")
+    runner.expectEqual(
+        CaretContinuation.join("The build passes.", following: "I checked and "),
+        "the build passes.")
+}
+
+await runner.test("a transcript after a finished sentence keeps its capital") {
+    for ending in ["Done. ", "Done! ", "Done?\n", "Done:\n"] {
+        runner.expect(
+            CaretContinuation.join("We should ship it.", following: ending)
+                .contains("We should ship it."),
+            "capital kept after \(ending.debugDescription)")
+    }
+}
+
+// The rule that protects names. A word the list does not know keeps its
+// capital, because wrongly lowercasing somebody's name is worse than leaving a
+// stray capital.
+await runner.test("only known function words are lowercased mid-sentence") {
+    runner.expectEqual(
+        CaretContinuation.join("Sarah said that.", following: "I told "),
+        "Sarah said that.")
+    runner.expectEqual(
+        CaretContinuation.join("GPU memory is tight.", following: "the "),
+        "GPU memory is tight.")
+    runner.expectEqual(
+        CaretContinuation.join("I think so.", following: "well "),
+        "I think so.")
+}
+
+// A space between two words, never inside one — the whole-app invariant.
+await runner.test("a space is added only where two words would fuse") {
+    runner.expect(
+        CaretContinuation.needsLeadingSpace(after: "and then", before: "we go"),
+        "two words would fuse")
+    runner.expect(
+        !CaretContinuation.needsLeadingSpace(after: "and then ", before: "we go"),
+        "already separated")
+    runner.expect(
+        !CaretContinuation.needsLeadingSpace(after: "note(", before: "we go"),
+        "an opening bracket wants the word against it")
+    runner.expect(
+        !CaretContinuation.needsLeadingSpace(after: "done", before: ", then"),
+        "punctuation belongs to the word before it")
+    runner.expect(
+        !CaretContinuation.needsLeadingSpace(after: "", before: "we go"),
+        "no prefix, no decision")
+}
+
+// An unreadable field is the common case in Chrome, and it must leave the
+// transcript exactly as this app has always produced it.
+await runner.test("no prefix means no change at all") {
+    runner.expectEqual(
+        CaretContinuation.join("We should ship it.", following: ""),
+        "We should ship it.")
+}
+
+// One implementation, so Whisper's segment rule and the caret rule cannot
+// drift apart.
+await runner.test("Whisper's segment rule and the caret rule agree") {
+    for (previous, next) in [("like whatever ", "There's more"), ("a pause ", "Of that day")] {
+        runner.expectEqual(
+            WhisperEngine.loweringSegmentInitial(next, following: previous),
+            CaretContinuation.lowercasingOpeningWord(next, following: previous))
+    }
+}
+
+// Each of these lowercased a real first word in Chrome before it was a rule.
+await runner.test("an empty Chrome box reporting its placeholder has nothing before the caret") {
+    runner.expectEqual(
+        ScreenContext.caretPrefix(value: "Ask anything", caret: 0, placeholder: "Ask anything"), "")
+    runner.expectEqual(
+        ScreenContext.caretPrefix(
+            value: "Reply to Claude…", caret: nil, placeholder: "Reply to Claude…"), "")
+}
+
+await runner.test("a caret at the start has nothing before it") {
+    runner.expectEqual(ScreenContext.caretPrefix(value: "some text", caret: 0, placeholder: nil), "")
+}
+
+await runner.test("an unknown caret position is unknown, not the whole field") {
+    runner.expectEqual(ScreenContext.caretPrefix(value: "and then", caret: nil, placeholder: nil), nil)
+}
+
+await runner.test("a real caret mid-field gives the text before it") {
+    runner.expectEqual(
+        ScreenContext.caretPrefix(value: "and then we left", caret: 9, placeholder: nil), "and then ")
+}
+
+// End to end: the Chrome case must now keep the capital.
+await runner.test("dictating into an empty Chrome box keeps the first capital") {
+    let prefix = ScreenContext.caretPrefix(
+        value: "Ask anything", caret: 0, placeholder: "Ask anything") ?? ""
+    runner.expectEqual(
+        CaretContinuation.join("We should ship it.", following: prefix), "We should ship it.")
+}
+
+// MARK: - Screen context
+
+// The tail is what is recent: accessibility trees follow document order and a
+// conversation appends at the end, so a budget cut from the front keeps the
+// latest exchange rather than the page header.
+await runner.test("context keeps the end of the text, cut at a word boundary") {
+    let long = (1...400).map { "word\($0)" }.joined(separator: " ")
+    let tail = ScreenContext.tail(of: long)
+    runner.expect(tail.count <= ScreenContext.characterBudget, "within budget")
+    runner.expect(tail.hasSuffix("word400"), "keeps the most recent end")
+    runner.expect(!tail.hasPrefix("ord"), "never starts mid-word")
+}
+
+await runner.test("short context is returned whole, with whitespace collapsed") {
+    runner.expectEqual(ScreenContext.tail(of: "  Murmur   uses\nSpeechAnalyzer  "),
+        "Murmur uses SpeechAnalyzer")
+}
+
+// The narrow part, and the one that decides whether this feature can corrupt a
+// transcript. `CleanupGuard` rejects words the speaker never said; context has
+// to loosen that, so it may only loosen it for the class of word context can
+// help with. Ordinary prose from a conversation must never become licence for
+// the cleaner to reword a sentence.
+await runner.test("only names and identifiers are taken from context") {
+    let terms = ScreenContext.terms(
+        in: "the quick brown fox uses SpeechAnalyzer and Murmur with an M5 chip today")
+    runner.expect(terms.contains("SpeechAnalyzer"), "inner capital is a name")
+    runner.expect(terms.contains("Murmur"), "capitalized word is a name")
+    runner.expect(terms.contains("M5"), "letters with digits are an identifier")
+    for ordinary in ["the", "quick", "brown", "fox", "uses", "with", "today"] {
+        runner.expect(!terms.contains(ordinary), "\(ordinary) is ordinary prose")
+    }
+}
+
+await runner.test("context terms are deduplicated and bounded") {
+    let terms = ScreenContext.terms(in: "Murmur murmur MURMUR Murmur, Murmur.")
+    runner.expectEqual(terms.count, 1)
+    runner.expect(ScreenContext.terms(in: "A Bc \(String(repeating: "x", count: 60))").isEmpty,
+        "too short or too long is skipped")
+}
+
+// A prompt that carried the screen without saying what it was for would invite
+// the model to answer it, which is the failure `wrap` already exists to stop.
+await runner.test("the context block is fenced and says what it is for") {
+    let block = FoundationModelsCleaner.contextBlock("Murmur and SpeechAnalyzer")
+    runner.expect(block.contains("<<<SCREEN"), "fenced like the transcript")
+    runner.expect(block.contains("SCREEN>>>"), "closed")
+    runner.expect(block.lowercased().contains("do not answer"), "refuses to be addressed")
+    runner.expectEqual(FoundationModelsCleaner.contextBlock(nil), "")
+    runner.expectEqual(FoundationModelsCleaner.contextBlock("   \n  "), "")
+}
+
+await runner.test("a cleanup prompt without context is unchanged") {
+    runner.expectEqual(
+        FoundationModelsCleaner.wrap("hello there"),
+        FoundationModelsCleaner.wrap("hello there", context: nil))
+}
+
+// One context field, two different questions, and neither may read as a
+// continuation of the other.
+await runner.test("Qwen context labels the vocabulary and the screen separately") {
+    let both = MLXAudioEngine.qwenContext(
+        phrases: ["VS Code", "Murmur"], surrounding: "the parakeet decoder")
+    runner.expect(both.contains("Terms used often: VS Code, Murmur"), "vocabulary labelled")
+    runner.expect(both.contains("On screen: the parakeet decoder"), "screen labelled")
+    runner.expectEqual(
+        MLXAudioEngine.qwenContext(phrases: [], surrounding: ""), "")
+    runner.expectEqual(
+        MLXAudioEngine.qwenContext(phrases: ["Murmur"], surrounding: "  "),
+        "Terms used often: Murmur")
+}
+
 // MARK: - Model catalog
 
 runner.suite("Model catalog")
 
 await runner.test("both layers offer the expected number of models") {
-    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 19)
+    runner.expectEqual(ModelCatalog.models(in: .speechRecognition).count, 20)
     runner.expectEqual(ModelCatalog.models(in: .correction).count, 5)
 }
 

@@ -7,7 +7,7 @@ let package = Package(
     dependencies: [
         // Core ML streaming ASR engines (Parakeet EOU, Nemotron). Apache 2.0.
         // Model weights are fetched at runtime, never bundled.
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.0"),
+        .package(path: "/private/tmp/claude-501/-Users-sikaihuang-Projects-Murmur/09b3cd93-e08d-4670-a83f-a9c365c53e6e/scratchpad/FluidAudio"),
         // Downloadable local LLMs for the cleanup layer. Requires the Metal
         // toolchain, so a full Xcode install is needed to build this target.
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.31.3"),

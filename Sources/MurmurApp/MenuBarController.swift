@@ -326,6 +326,7 @@ final class MenuBarController {
         controller.scratchEnabled = preferences.scratchEnabled
         controller.meterStyle = preferences.meterStyle
         controller.keepMicrophoneArmed = preferences.keepMicrophoneArmed
+        controller.readsScreenContext = preferences.readsScreenContext
         controller.microphoneIdleTimeout = .seconds(preferences.microphoneIdleMinutes * 60)
         // Setting the preference above only reacts to a *change*, so a
         // device closed by something else stays closed. This is what

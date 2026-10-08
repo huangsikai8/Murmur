@@ -119,6 +119,16 @@ if let index = CommandLine.arguments.firstIndex(of: "--download") {
 // Answers "why did that go to the clipboard?" by naming the element that had
 // focus. Counts down first so the window you are asking about can be brought
 // to the front, since running this in a terminal focuses the terminal.
+// `--testaxtree [application]` asks whether an application exposes an
+// accessibility tree at all, and how long it takes after Chromium's opt-in is
+// set. `Murmur.log` records "unreadable" for three different failures, and a
+// context feature that reads the focused field is worth building only where the
+// answer here is yes.
+if let index = CommandLine.arguments.firstIndex(of: "--testaxtree") {
+    let rest = Array(CommandLine.arguments.dropFirst(index + 1).prefix { !$0.hasPrefix("--") })
+    exit(runBlocking { await AccessibilityProbe.run(applicationName: rest.first) })
+}
+
 if CommandLine.arguments.contains("--testfocus") {
     ClipboardPasteInserter.diagnostics = { print("  \($0)") }
     print("Click into whatever you want to test. Sampling in 5 seconds…\n")

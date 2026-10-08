@@ -138,6 +138,23 @@ private struct GeneralSettings: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+                Toggle(
+                    "Use the text on screen to spell names",
+                    isOn: $preferences.readsScreenContext
+                )
+                .onChange(of: preferences.readsScreenContext) { _, _ in onChange() }
+                Text(
+                    "Reads the text around where your dictation will land \u{2014} the "
+                        + "document you are editing, or the conversation above the box you "
+                        + "are typing into \u{2014} and uses it to spell names, products "
+                        + "and technical terms the way they are already spelled there. It "
+                        + "cannot change which words are transcribed, only how they are "
+                        + "written, unless the speech model itself accepts context. "
+                        + "Everything stays on this Mac and nothing is stored."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
                 Toggle("Keep the microphone open between dictations", isOn: $preferences.keepMicrophoneArmed)
                     .onChange(of: preferences.keepMicrophoneArmed) { _, _ in onChange() }
                 Text(

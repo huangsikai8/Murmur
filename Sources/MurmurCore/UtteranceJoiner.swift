@@ -18,6 +18,13 @@ public struct UtteranceJoiner {
 
     public init() {}
 
+    /// Whether nothing has been inserted yet in this run.
+    ///
+    /// The caret's own text is the right thing to join to only for the first
+    /// utterance; after that, the text before the insertion point is this app's
+    /// own previous one and this type owns that seam.
+    public var isAtStart: Bool { previous == nil }
+
     /// Punctuation that belongs tight against the preceding word. A recognizer
     /// that resumes with ", and then" must not be pushed away from it.
     private static let hugsPreviousWord: Set<Character> = [

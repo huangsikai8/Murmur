@@ -18,6 +18,7 @@ final class Preferences: ObservableObject {
         static let handsFreeSilenceMilliseconds = "murmur.handsFreeSilenceMilliseconds"
         static let handsFreeIdleMinutes = "murmur.handsFreeIdleMinutes"
         static let formatting = "murmur.formatting"
+        static let readsScreenContext = "murmur.readsScreenContext"
         static let handsFreeToggleShortcut = "murmur.handsFreeToggleShortcut"
         static let handsFreeToggleChord = "murmur.handsFreeToggleChord"
         static let historyChord = "murmur.historyChord"
@@ -125,6 +126,20 @@ final class Preferences: ObservableObject {
     }
 
     /// Whether saying "scratch that" takes back the last insertion.
+    /// Whether the text already on screen may be read and handed to the cleanup
+    /// model, so names and technical terms are spelled the way the document
+    /// spells them.
+    ///
+    /// Off by default, and it should stay that way until someone chooses it.
+    /// Reading the field you are typing into is one thing; reading the
+    /// conversation around it is another, even though it never leaves this Mac
+    /// — the measurements behind this feature found 52,857 characters readable
+    /// in one VS Code panel, which is a good deal more than "the sentence I am
+    /// dictating into".
+    @Published var readsScreenContext: Bool {
+        didSet { defaults.set(readsScreenContext, forKey: Key.readsScreenContext) }
+    }
+
     /// Whether the input device stays open between dictations.
     ///
     /// On, a press only switches where the audio goes and costs 0.7 ms. Off,
@@ -212,6 +227,9 @@ final class Preferences: ObservableObject {
             ?? .waveform
         keepMicrophoneArmed =
             (defaults.object(forKey: Key.keepMicrophoneArmed) as? Bool) ?? true
+        // Default off: this one reads what is on screen, so it is opted into
+        // rather than out of.
+        readsScreenContext = defaults.bool(forKey: Key.readsScreenContext)
         // `object(forKey:)`, so a deliberate "Never" survives a restart rather
         // than reading as unset and reverting to the default.
         microphoneIdleMinutes = (defaults.object(forKey: Key.microphoneIdleMinutes) as? Int) ?? 15

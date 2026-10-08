@@ -208,7 +208,9 @@ public actor MLXCleaner: TranscriptCleaner {
         return 320
     }
 
-    public func clean(_ text: String, level: CleanupLevel) async throws -> String {
+    public func clean(_ text: String, level: CleanupLevel, context: String?) async throws
+        -> String
+    {
         guard level != .off else { return text }
         try await prepare()
         guard let container else {
@@ -223,13 +225,13 @@ public actor MLXCleaner: TranscriptCleaner {
             generateParameters: .init(maxTokens: tokenBudget)
         )
         let reply = try await session.respond(
-            to: FoundationModelsCleaner.wrap(text) + promptSuffix)
+            to: FoundationModelsCleaner.wrap(text, context: context) + promptSuffix)
 
         return CleanupGuard.accept(
             original: text,
             cleaned: Self.stripReasoning(reply),
             level: level,
-            knownTerms: protectedTerms.map(\.text)
+            knownTerms: protectedTerms.map(\.text) + ScreenContext.terms(in: context ?? "")
         )
     }
 

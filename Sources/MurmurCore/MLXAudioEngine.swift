@@ -82,6 +82,12 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
     /// has anywhere to put it.
     private var contextualPhrases: [String] = []
 
+    /// Text on screen where the transcript will land, as `setSurroundingText`
+    /// last gave it. This is the half of context that cleanup cannot do: it
+    /// reaches the recognizer, so it can change which words come back rather
+    /// than only how they are spelled afterwards.
+    private var surroundingText: String = ""
+
     /// Samples for the current utterance, at 16 kHz mono.
     private var samples: [Float] = []
     private var updateContinuation: AsyncStream<TranscriptUpdate>.Continuation?
@@ -190,6 +196,26 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
             .joined(separator: ", ")
     }
 
+    /// The vocabulary and the screen, as one piece of free text.
+    ///
+    /// Both go in, because the model has one context field and the two answer
+    /// different questions: the vocabulary is what this speaker says often, the
+    /// screen is what this conversation is about. Labelled rather than
+    /// concatenated, so neither reads as a continuation of the other.
+    public static func qwenContext(phrases: [String], surrounding: String) -> String {
+        var parts: [String] = []
+        let vocabulary = qwenContext(for: phrases)
+        if !vocabulary.isEmpty { parts.append("Terms used often: \(vocabulary)") }
+        let trimmed = surrounding.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { parts.append("On screen: \(trimmed)") }
+        return parts.joined(separator: ". ")
+    }
+
+    /// Text already on screen where this transcript will land. Empty clears it.
+    public func setSurroundingText(_ text: String) async {
+        surroundingText = text
+    }
+
     /// All three models read 16 kHz mono.
     public func preferredInputFormat() async -> AVAudioFormat? {
         AVAudioFormat(
@@ -274,7 +300,8 @@ public actor MLXAudioEngine: SpeechRecognitionEngine {
                 qwen.generate(
                     audio: MLXArray(collected),
                     context: Self.sendsVocabularyContext
-                        ? Self.qwenContext(for: contextualPhrases) : "",
+                        ? Self.qwenContext(
+                            phrases: contextualPhrases, surrounding: surroundingText) : "",
                     language: variant.languageHint)
             } else {
                 model.generate(

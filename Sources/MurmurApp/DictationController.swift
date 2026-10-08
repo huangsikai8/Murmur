@@ -62,6 +62,10 @@ final class DictationController {
     private var buffer = TranscriptBuffer()
     private var updatesTask: Task<Void, Never>?
     private var focusTarget: FocusTracker.Target?
+
+    /// What was on screen when the key went down, or nil when the preference is
+    /// off. Only ever read by the cleanup pass.
+    private var screenContext: ScreenContext.Reading?
     /// Readable so the latch can ask whether a tap should start or finish.
     private(set) var isActive = false
     private var pressedAt: ContinuousClock.Instant?
@@ -337,6 +341,7 @@ final class DictationController {
 
         buffer.reset()
         focusTarget = FocusTracker.capture()
+        readScreenContext()
         overlay.show(showsMeter: !engineStreamsLiveText)
         startMeter()
         status = .listening
@@ -360,6 +365,10 @@ final class DictationController {
     /// it never existed. Held open, a press only swaps where the buffers go.
     /// The trade is the orange microphone indicator staying lit, so this is a
     /// preference rather than a decision made here.
+    /// Whether on-screen text may be read as context for the cleanup pass.
+    /// Mirrors the preference, applied the way every other one here is.
+    var readsScreenContext = false
+
     var keepMicrophoneArmed = true {
         didSet {
             guard keepMicrophoneArmed != oldValue else { return }
@@ -1050,6 +1059,11 @@ final class DictationController {
         }
         transcript = VocabularyNormalizer.apply(vocabulary.allTerms, to: transcript)
 
+        // Only the first utterance of a continuous run joins the caret: after
+        // that the text before it is this app's own previous insertion, and
+        // `UtteranceJoiner` owns that seam.
+        if joiner.isAtStart { transcript = continuingFromCaret(transcript) }
+
         // Applied after every other stage, so nothing downstream can strip it.
         let separator = joiner.separator(before: transcript, target: target?.bundleIdentifier)
 
@@ -1084,15 +1098,69 @@ final class DictationController {
         logUtterance(readyAt: readyAt, queuedMs: queuedMs, cleanupMs: cleanupMs)
     }
 
+    /// Joins a finished transcript to the text already before the caret.
+    ///
+    /// Silent when the field could not be read, which is the common case in
+    /// Chrome — and deliberately so: no prefix means the behaviour this app has
+    /// always had, a capital and no added space, rather than a guess.
+    private func continuingFromCaret(_ transcript: String) -> String {
+        guard let prefix = screenContext?.caretPrefix, !prefix.isEmpty else { return transcript }
+        let joined = CaretContinuation.join(transcript, following: prefix)
+        if joined != transcript {
+            Log.write("caret continuation: joined to the text before the insertion point")
+        }
+        return joined
+    }
+
+    /// Text on screen where this transcript will land, read once per press.
+    ///
+    /// Started here rather than at cleanup time because the walk costs about
+    /// 0.2 s on a loaded page and the answer is not needed until the key comes
+    /// up — so it runs while someone is still speaking and costs nothing that
+    /// anyone waits for. Read at the *press* for a second reason: by the time a
+    /// transcript is ready, focus may have moved.
+    private func readScreenContext() {
+        screenContext = nil
+        guard readsScreenContext else { return }
+        let pid = focusTarget?.application?.processIdentifier
+        let token = sessionToken
+        Task.detached(priority: .utility) { [weak self] in
+            let reading = ScreenContext.read(target: pid)
+            await self?.storeScreenContext(reading, token: token)
+        }
+    }
+
+    /// Keeps the reading only while the press it belongs to still owns the
+    /// session, the same hazard `sessionToken` exists for everywhere else: a
+    /// slow read landing after the next press would hand one dictation the
+    /// screen of another.
+    private func storeScreenContext(_ reading: ScreenContext.Reading?, token: UInt64) {
+        guard token == sessionToken else { return }
+        screenContext = reading
+        if let reading {
+            // Also to the recognizer, for the one engine that can use it. Safe
+            // after `beginSession` because every engine that accepts this is a
+            // batch engine: nothing is decoded until the key comes up.
+            let engine = self.engine
+            let text = reading.text
+            Task { await engine.setSurroundingText(text) }
+            Log.write(
+                reading.text.isEmpty
+                    ? "screen context: none — \(reading.source)"
+                    : "screen context: \(reading.text.count) characters from \(reading.source)")
+        }
+    }
+
     /// Cleans `text`, or returns it untouched if cleanup fails or overruns.
     ///
     /// Cleanup is a convenience: on failure the raw transcript is still
     /// inserted rather than losing what was dictated.
     private func cleanUp(_ text: String, level: CleanupLevel) async -> String {
         let cleaner = self.cleaner
+        let context = screenContext?.text
         let cleaned = await withDeadline(cleanupDeadline) { () -> String? in
             do {
-                return try await cleaner.clean(text, level: level)
+                return try await cleaner.clean(text, level: level, context: context)
             } catch {
                 Log.write("cleanup failed, inserting raw transcript: \(error)")
                 return nil
@@ -1365,6 +1433,10 @@ final class DictationController {
         // Enforce the user's own spelling last, so neither the recognizer nor
         // the cleanup model can undo it.
         transcript = VocabularyNormalizer.apply(vocabulary.allTerms, to: transcript)
+
+        // And join it to whatever the caret is sitting after. Last of all, so
+        // no later stage can recapitalize what this just decided.
+        transcript = continuingFromCaret(transcript)
 
         // Dismiss before pasting so the overlay is never captured mid-insert.
         overlay.hide()

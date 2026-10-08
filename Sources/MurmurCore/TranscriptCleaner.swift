@@ -13,7 +13,10 @@ public protocol TranscriptCleaner: AnyObject, Sendable {
     /// Returns a corrected version of `text` at the requested strength.
     /// Implementations must preserve meaning and must never answer questions
     /// contained in the text.
-    func clean(_ text: String, level: CleanupLevel) async throws -> String
+    /// `context` is text already on screen where the transcript will land. It
+    /// may only steer spelling and capitalization of names and technical terms;
+    /// it is never content to draw phrasing from, and never something to answer.
+    func clean(_ text: String, level: CleanupLevel, context: String?) async throws -> String
 
     /// Drops the model from memory.
     func releaseModels() async
@@ -25,6 +28,11 @@ public protocol TranscriptCleaner: AnyObject, Sendable {
 extension TranscriptCleaner {
     /// Cleaners that do not rewrite anything ignore the word list.
     public func setProtectedTerms(_ terms: [String]) async {}
+
+    /// Callers with nothing on screen to offer, and every existing call site.
+    public func clean(_ text: String, level: CleanupLevel) async throws -> String {
+        try await clean(text, level: level, context: nil)
+    }
 }
 
 /// Default cleaner: returns the transcript untouched.
@@ -36,6 +44,8 @@ public final class PassthroughCleaner: TranscriptCleaner {
 
     public init() {}
     public func prepare() async throws {}
-    public func clean(_ text: String, level: CleanupLevel) async throws -> String { text }
+    public func clean(_ text: String, level: CleanupLevel, context: String?) async throws
+        -> String
+    { text }
     public func releaseModels() async {}
 }

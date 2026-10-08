@@ -65,6 +65,15 @@ public protocol SpeechRecognitionEngine: AnyObject, Sendable {
     /// Terms to bias recognition toward, so unusual words are actually heard.
     func setContextualPhrases(_ phrases: [String]) async
 
+    /// Text already on screen where this transcript will land, for engines that
+    /// take free-text context. Unlike a phrase list this can change *which*
+    /// words come back, so it reaches recognition rather than only the cleanup
+    /// pass that follows it. A requirement rather than an extension member
+    /// only, for the reason `biasesTowardPhrases` carries: the app asks through
+    /// `any SpeechRecognitionEngine`, where an extension-only member is
+    /// dispatched statically and every engine would answer with the no-op.
+    func setSurroundingText(_ text: String) async
+
     /// Whether text appears while you speak, rather than only on release.
     ///
     /// Asked of the engine rather than read off the catalog, because the
@@ -82,6 +91,10 @@ public protocol SpeechRecognitionEngine: AnyObject, Sendable {
 }
 
 extension SpeechRecognitionEngine {
+    /// Engines with nowhere to put free text ignore it, which is all of them
+    /// but Qwen3-ASR.
+    public func setSurroundingText(_ text: String) async {}
+
     /// Engines without contextual biasing simply ignore the word list.
     public func setContextualPhrases(_ phrases: [String]) async {}
 
@@ -118,6 +131,7 @@ public enum SpeechEngineFactory {
             return MoonshineEngine(variant: variant)
         }
         if modelID == ParakeetBatchEngine.modelID { return ParakeetBatchEngine() }
+        if modelID == CohereCoreMLEngine.modelID { return CohereCoreMLEngine() }
         if let variant = WhisperEngine.Variant.from(modelID: modelID) {
             return WhisperEngine(variant: variant)
         }

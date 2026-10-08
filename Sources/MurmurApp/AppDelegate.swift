@@ -57,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WhisperEngine.diagnosticLog = { Log.write($0) }
         MLXAudioEngine.diagnosticLog = { Log.write($0) }
         GraniteCTCEngine.diagnosticLog = { Log.write($0) }
+        CohereCoreMLEngine.diagnosticLog = { Log.write($0) }
         ModelCatalog.coreMLEngineWired = true
         // MLX is compiled in, so the downloadable language models may be offered.
         ModelCatalog.mlxSupported = true

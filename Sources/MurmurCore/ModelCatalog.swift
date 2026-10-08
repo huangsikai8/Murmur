@@ -349,6 +349,34 @@ public enum ModelCatalog {
                 + "run on the GPU."
         ),
         AIModelDescriptor(
+            id: CohereCoreMLEngine.modelID,
+            layer: .speechRecognition,
+            name: "Cohere Transcribe 2B (Core ML)",
+            vendor: "Cohere via FluidAudio",
+            sizeMB: 2190,
+            license: "Apache 2.0",
+            streams: false,
+            runtime: .coreML,
+            punctuates: true,
+            summary:
+                "The same checkpoint as the MLX entry, compiled for Core ML, so the "
+                + "decoder runs on the Neural Engine instead of holding 3 GB of GPU "
+                + "memory. 8-bit weights."
+        ),
+        // Cohere Transcribe through FluidAudio's Core ML build is implemented
+        // (`CohereCoreMLEngine`) and deliberately not offered here. It transcribes
+        // perfectly — 0 errors in 30 words — and is unusable: measured on one
+        // 20-second clip, 52,003 ms and a peak footprint of 11,214 MB, against
+        // 463 ms and 3138 MB for the same checkpoint through MLX. The 11 GB is
+        // MALLOC_LARGE, ordinary heap, climbing through a single decode, and
+        // `CoherePipeline` has no `autoreleasepool` anywhere in its decode loop:
+        // ~108 steps each allocating cross-attention caches over 3500 encoder
+        // frames. That is inside the package, so it cannot be fixed from here.
+        // Listing it would put a model in Settings that pages this machine for a
+        // minute per hold — the stall class that takes the keyboard with it.
+        // Restore this entry, and the count in `MurmurTests`, once the upstream
+        // loop drains.
+        AIModelDescriptor(
             id: MLXAudioEngine.Variant.graniteSpeech41.modelID,
             layer: .speechRecognition,
             name: "IBM Granite Speech 4.1 2B",
@@ -489,6 +517,7 @@ public enum ModelCatalog {
             ids.insert(variant.modelID)
         }
         if ParakeetBatchEngine.isInstalled { ids.insert(ParakeetBatchEngine.modelID) }
+        if CohereCoreMLEngine.isInstalled { ids.insert(CohereCoreMLEngine.modelID) }
         for variant in WhisperEngine.Variant.allCases where WhisperEngine.isInstalled(variant) {
             ids.insert(variant.modelID)
         }
@@ -522,6 +551,10 @@ public enum ModelCatalog {
             try await ParakeetBatchEngine().install()
             return
         }
+        if descriptor.id == CohereCoreMLEngine.modelID {
+            try await CohereCoreMLEngine().install(progress: progress)
+            return
+        }
         if let variant = WhisperEngine.Variant.from(modelID: descriptor.id) {
             try await WhisperEngine(variant: variant).install(progress: progress)
             return
@@ -553,6 +586,10 @@ public enum ModelCatalog {
         }
         if descriptor.id == ParakeetBatchEngine.modelID {
             try ParakeetBatchEngine.delete()
+            return
+        }
+        if descriptor.id == CohereCoreMLEngine.modelID {
+            try CohereCoreMLEngine.delete()
             return
         }
         if let variant = WhisperEngine.Variant.from(modelID: descriptor.id) {
